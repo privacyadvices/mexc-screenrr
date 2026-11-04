@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+:root {
+  --background: #06080d;
+  --foreground: #e4e4e7;
+  --font-sans: var(--font-inter), 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: var(--font-jetbrains), 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Monaco', ui-monospace, monospace;
+  /* Softer, lower-glare up/down colors for long reading sessions on dark backgrounds */
+  --up: #3ee0a1;
+  --down: #ff6b81;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  letter-spacing: -0.006em;
+  /* Inter: open digits, disambiguated l/I/1 */
+  font-feature-settings: "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums slashed-zero;
+  letter-spacing: -0.015em;
+}
+
+/* Table numbers: Inter with fixed-width (tabular) digits — narrower and easier to scan than monospace,
+   while keeping every column perfectly aligned */
+.tabular-nums {
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum", "cv11", "ss01";
+  letter-spacing: -0.003em;
+}
+
+/* Muted currency / unit prefixes inside numeric cells */
+.num-dim {
+  color: rgb(113 113 122 / 0.9);
+  font-weight: 400;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #080a10;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #262c3d;
+  border-radius: 4px;
+  border: 2px solid #080a10;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4360;
+}
+
+::-webkit-scrollbar-corner {
+  background: #080a10;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.25);
+  color: #f4f4f5;
+}
+
+:focus-visible {
+  outline: 2px solid rgba(34, 211, 238, 0.6);
+  outline-offset: 1px;
+}
