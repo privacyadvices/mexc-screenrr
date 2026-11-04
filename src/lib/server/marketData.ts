@@ -25,7 +25,7 @@ const KLINE_CACHE_TTL_MS = 180_000;
 const KLINE_MAX_USABLE_AGE_MS = 30 * 60_000;
 const MCAP_CACHE_TTL_MS = 30 * 60_000;
 const CONTRACT_DETAIL_TTL_MS = 30 * 60_000;
-const KLINE_LIMIT = 1500; // 1,500 1-minute bars (25 hours) covers full 24h (1d) metrics while saving 25% CPU & RAM
+const KLINE_LIMIT = 760; // 760 1-minute bars (12.6 hours) covers all sub-24h windows (5m..12h) at 2x speed while 1d comes from 24h ticker
 
 const SPAGHETTI_SYMBOL_LIMIT: Record<ExchangeId, number> = {
   mexc: 90,
@@ -2395,21 +2395,22 @@ async function buildScreener(
 
   const baseSyncBatch =
     exchange === "mexc"
-      ? mode === "fast"
-        ? 25
-        : 40
+      ? 18
       : exchange === "binance"
         ? mode === "fast"
           ? 16
-          : 28
+          : 24
         : exchange === "hyperliquid"
           ? mode === "fast"
             ? 24
-            : 55
+            : 40
           : mode === "fast"
-            ? 28
-            : 75;
-  const maxSyncBatch = Math.max(baseSyncBatch, Math.min(32, extraSymbols.length + 4));
+            ? 24
+            : 45;
+  const maxSyncBatch =
+    exchange === "mexc"
+      ? 18
+      : Math.max(baseSyncBatch, Math.min(28, extraSymbols.length + 4));
   const syncSymbols = needsFetch.slice(0, maxSyncBatch);
 
   const fetched = await fetchInBatches(
@@ -2450,8 +2451,7 @@ async function buildScreener(
     totalContracts: rows.length,
     klineSymbolsCount,
     oiHistoryMinutes: getOiHistoryMinutes(exchange),
-    quality: klineSymbolsCount >= Math.min(60, fullLimit) ? "full" : mode,
-    ...(klineSymbolsCount < Math.min(60, fullLimit) ? { nextRefreshMs: 2500 } : {}),
+    quality: klineSymbolsCount >= Math.min(36, fullLimit) ? "full" : mode,
   };
 }
 
@@ -2521,13 +2521,16 @@ export async function getScreenerPayload(
   // Delta-only hydration mode (`?symbols=A,B,C&partial=1`):
   // Composes & returns ONLY the requested symbols (~25 KB instead of ~1.8 MB), cutting Vercel Fast Origin Transfer & CPU by ~98%.
   if (partialOnly && extraSymbols.length > 0) {
-    const requestedSlice = extraSymbols.slice(0, 25);
+    const maxBatch = exchange === "mexc" ? 17 : 24;
+    const requestedSlice = extraSymbols.slice(0, maxBatch);
     const requestedSet = new Set(requestedSlice);
     const btcSymbol = getBtcSymbolForExchange(exchange);
-    const toFetch = [...new Set([btcSymbol, ...requestedSlice])].filter((sym) => {
-      const c = klineCache.get(`${exchange}:${sym}:1m`);
-      return !c || now - c.at >= KLINE_CACHE_TTL_MS;
-    });
+    const toFetch = [...new Set([btcSymbol, ...requestedSlice])]
+      .filter((sym) => {
+        const c = klineCache.get(`${exchange}:${sym}:1m`);
+        return !c || now - c.at >= KLINE_CACHE_TTL_MS;
+      })
+      .slice(0, exchange === "mexc" ? 18 : 25);
     if (exchange === "binance") {
       await refreshBinanceOiBatch(requestedSlice);
     }
@@ -2665,15 +2668,6 @@ export async function getScreenerPayload(
     if (!cached) {
       const fast = await buildScreener(exchange, "fast", extraSymbols);
       screenerCache.set(exchange, { at: Date.now(), payload: fast });
-
-      void buildScreener(exchange, "full", extraSymbols)
-        .then((full) => {
-          screenerCache.set(exchange, { at: Date.now(), payload: full });
-        })
-        .catch(() => {
-          // Keep fast payload if full fails
-        });
-
       return fast;
     }
 

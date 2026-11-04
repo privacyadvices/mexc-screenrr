@@ -1389,6 +1389,21 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           }
 
           if (Object.keys(patches).length > 0) {
+            const histMap = clientPriceHistoryRef.current;
+            for (const [sym, p] of Object.entries(patches)) {
+              if (!Number.isFinite(p.price) || p.price <= 0) continue;
+              let arr = histMap.get(sym);
+              if (!arr) {
+                arr = [{ ts: now, price: p.price }];
+                histMap.set(sym, arr);
+              } else {
+                const last = arr[arr.length - 1];
+                if (!last || now - last.ts >= 10_000) {
+                  arr.push({ ts: now, price: p.price });
+                  if (arr.length > 96) arr.shift();
+                }
+              }
+            }
             Object.assign(pendingPatches, patches);
             hasPending = true;
           }
@@ -1425,6 +1440,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     };
   }, [exchange, wsEnabled]);
 
+  const clientPriceHistoryRef = useRef<Map<string, Array<{ ts: number; price: number }>>>(new Map());
+
   // Clear flash highlights periodically
   useEffect(() => {
     if (Object.keys(priceFlashes).length === 0) return;
@@ -1440,6 +1457,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
   const mergedRows = useMemo(() => {
     if (!data) return [];
     if (Object.keys(livePatches).length === 0) return data.rows;
+    const histMap = clientPriceHistoryRef.current;
 
     return data.rows.map((row) => {
       const patch = livePatches[row.symbol];
@@ -1458,6 +1476,26 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         return ((patch.price - anchorPrice) / anchorPrice) * 100;
       };
 
+      let chg5mPct = reanchorPct(row.changePct["5m"]);
+      let chg5mUsd = row.changeUsd["5m"] !== null ? row.changeUsd["5m"] + tickDeltaUsd : null;
+      const symHist = histMap.get(row.symbol);
+      if (symHist && symHist.length >= 2) {
+        const target5mTs = patch.updatedAt - 300_000;
+        let best5m: { ts: number; price: number } | null = null;
+        let bestDiff = Infinity;
+        for (const pt of symHist) {
+          const d = Math.abs(pt.ts - target5mTs);
+          if (d < bestDiff) {
+            bestDiff = d;
+            best5m = pt;
+          }
+        }
+        if (best5m && bestDiff <= 45_000 && best5m.price > 0) {
+          chg5mPct = ((patch.price - best5m.price) / best5m.price) * 100;
+          chg5mUsd = patch.price - best5m.price;
+        }
+      }
+
       return {
         ...row,
         price: patch.price,
@@ -1470,7 +1508,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         volToOi: liveOiUsd && liveOiUsd > 0 && liveVol1d ? liveVol1d / liveOiUsd : row.volToOi,
         changePct: {
           ...row.changePct,
-          "5m": reanchorPct(row.changePct["5m"]),
+          "5m": chg5mPct,
           "15m": reanchorPct(row.changePct["15m"]),
           "1h": reanchorPct(row.changePct["1h"]),
           "4h": reanchorPct(row.changePct["4h"]),
@@ -1480,7 +1518,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         },
         changeUsd: {
           ...row.changeUsd,
-          "5m": row.changeUsd["5m"] !== null ? row.changeUsd["5m"] + tickDeltaUsd : null,
+          "5m": chg5mUsd,
           "15m": row.changeUsd["15m"] !== null ? row.changeUsd["15m"] + tickDeltaUsd : null,
           "1h": row.changeUsd["1h"] !== null ? row.changeUsd["1h"] + tickDeltaUsd : null,
           "4h": row.changeUsd["4h"] !== null ? row.changeUsd["4h"] + tickDeltaUsd : null,
@@ -2114,22 +2152,26 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       ? `${virtualItems[0].index}-${virtualItems[virtualItems.length - 1].index}`
       : "0-0";
 
-  // Immediately enrich 1m klines for currently visible viewport rows + top 20 sorted/filtered rows (using lightweight partial=1 delta endpoint)
+  // Immediately enrich 1m klines for currently visible viewport rows + top un-enriched rows in current sort order
+  // using lightweight partial=1 delta endpoint (fits within 1 burst window = ~220ms with zero rate-limit wait!)
   useEffect(() => {
     if (!rows.length || !isClientActiveForPolling()) return;
     const now = Date.now();
+    const maxBatch = exchange === "mexc" ? 17 : 22;
     const candidateSymbols = new Set<string>();
     const candidateRows: Row[] = [];
 
     for (const vItem of rowVirtualizer.getVirtualItems()) {
       const r = rows[vItem.index];
-      if (r && !candidateSymbols.has(r.symbol)) {
+      if (r && r.hasKlines === false && !candidateSymbols.has(r.symbol)) {
         candidateSymbols.add(r.symbol);
         candidateRows.push(r);
       }
     }
-    for (const r of rows.slice(0, 24)) {
-      if (r && !candidateSymbols.has(r.symbol)) {
+    // Also include the first un-enriched rows within the top 54 sorted rows so that even when preferVerifiedKlines
+    // places existing hasKlines:true rows at 0..17, the next top movers immediately hydrate without waiting for a timer.
+    for (const r of rows.slice(0, 54)) {
+      if (r && r.hasKlines === false && !candidateSymbols.has(r.symbol)) {
         candidateSymbols.add(r.symbol);
         candidateRows.push(r);
       }
@@ -2137,18 +2179,17 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
     const missingTop = candidateRows
       .filter((r) => {
-        if (r.hasKlines !== false) return false;
         const lastReq = requestedKlinesRef.current.get(r.symbol) ?? 0;
         return now - lastReq > 120_000;
       })
-      .slice(0, 20)
+      .slice(0, maxBatch)
       .map((r) => r.symbol);
     if (missingTop.length === 0) return;
     for (const sym of missingTop) {
       requestedKlinesRef.current.set(sym, now);
     }
     void fetchScreenerData(missingTop);
-  }, [rows, virtualRangeKey, rowVirtualizer, fetchScreenerData, isClientActiveForPolling]);
+  }, [exchange, rows, virtualRangeKey, rowVirtualizer, fetchScreenerData, isClientActiveForPolling]);
 
   // Quota-friendly background kline warmer: warms only the top 60 sorted rows (not all 1,090) in lightweight partial=1 delta batches
   // every 18s ONLY while the user is actively interacting with the tab, with a 5-minute per-symbol cooldown.
