@@ -22,7 +22,7 @@ const FAST_CACHE_TTL_MS = 12_000;
 // 1-minute historical bars are immutable once closed and calcPerTimeframe adjusts for lagBars + live ticker tail.
 // A 3-minute kline TTL cuts serverless CPU & upstream exchange calls by ~70% without sacrificing live accuracy.
 const KLINE_CACHE_TTL_MS = 180_000;
-const KLINE_MAX_USABLE_AGE_MS = 30 * 60_000;
+const KLINE_MAX_USABLE_AGE_MS = 240_000;
 const MCAP_CACHE_TTL_MS = 30 * 60_000;
 const CONTRACT_DETAIL_TTL_MS = 30 * 60_000;
 const KLINE_LIMIT = 760; // 760 1-minute bars (12.6 hours) covers all sub-24h windows (5m..12h) at 2x speed while 1d comes from 24h ticker
@@ -1602,16 +1602,31 @@ function calcPerTimeframe(
     const hasCurrentVolWindow = !noBarsInWindow && n > 0 && startIdx >= 0 && startIdx < n;
 
     // 1. Orion Terminal exact Price Change % and Price Change $ formula:
-    //    `firstCandle = kline[startIdx]`, `changePercent = ((lastClose - firstCandle.open) / firstCandle.open) * 100`,
-    //    `changeDollar = lastClose * (changePercent / 100)`
+    //    Anchor denominator to `currentMinuteOpenSec - bars * 60` because `lastClose` is `livePrice` at `nowSec`.
+    //    Even when `kline` is cached for up to 3-4m, `kline.time` already contains the candle from `now - bars * 60`.
+    let priceStartIdx = startIdx;
+    if (!noBarsInWindow && lastBarSec > 0 && kline.time && kline.time.length === n) {
+      const liveTargetStartSec = currentMinuteOpenSec - bars * 60;
+      let pIdx = n - 1;
+      while (pIdx > 0 && kline.time[pIdx] > liveTargetStartSec) {
+        pIdx--;
+      }
+      if (kline.time[pIdx] < liveTargetStartSec - 60 && pIdx + 1 < n) {
+        pIdx = pIdx + 1;
+      } else if (kline.time[pIdx] < liveTargetStartSec && pIdx + 1 < n && kline.time[pIdx + 1] <= liveTargetStartSec + 60) {
+        pIdx = pIdx + 1;
+      }
+      priceStartIdx = pIdx;
+    }
+
     let changePctVal: number | null = null;
     let changeUsdVal: number | null = null;
     if (noBarsInWindow) {
       const snapChg = lookupSnapshotPriceChange(exchange, symbol, lastClose, tf);
       changePctVal = snapChg.pct ?? 0;
       changeUsdVal = snapChg.usd ?? 0;
-    } else if (startIdx >= 0 && startIdx < n) {
-      const candidateOpen = kline.open[startIdx] ?? kline.close[startIdx];
+    } else if (priceStartIdx >= 0 && priceStartIdx < n) {
+      const candidateOpen = kline.open[priceStartIdx] ?? kline.close[priceStartIdx];
       if (Number.isFinite(candidateOpen) && candidateOpen > 0) {
         changePctVal = pctChange(lastClose, candidateOpen);
         changeUsdVal =
@@ -2116,7 +2131,7 @@ function composeScreenerRows(
           changePctMap[tf] = pct;
           changeUsdMap[tf] = ticker.price - oldestPrice;
         } else {
-          // Timeframe-distinct non-zero estimate derived from live 24h drift, 24h range position, and intraday diffusion
+          // Timeframe-distinct non-zero estimate derived from live 24h drift, 24h range position, and any observed snapshot move
           const tfFrac = mins / 1440;
           const driftComponent = chg24Pct * (0.42 * tfFrac + 0.58 * Math.pow(tfFrac, 0.6)) * symFactor;
           const rangeComponent =
@@ -2126,6 +2141,11 @@ function composeScreenerRows(
             Math.max(0.025, Math.min(1.2, range24Pct * 0.025)) *
             Math.pow(tfFrac, 0.32);
           let estPct = driftComponent + rangeComponent + harmonicOffset;
+          if (oldestPrice && oldestPrice > 0 && oldestAgeMs >= 20_000 && oldestAgeMs < targetMs) {
+            const observedPct = ((ticker.price - oldestPrice) / oldestPrice) * 100;
+            const obsWeight = Math.min(0.85, Math.max(0.25, Math.sqrt(oldestAgeMs / targetMs)));
+            estPct = observedPct * obsWeight + estPct * (1 - obsWeight * 0.5);
+          }
           if (Math.abs(estPct) < 0.01) {
             const dir = chg24Pct > 0 ? 1 : chg24Pct < 0 ? -1 : rangePos >= 50 ? 1 : -1;
             estPct = dir * (0.012 + (idxTf + 1) * 0.006 * symFactor);

@@ -678,7 +678,6 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [quality, setQuality] = useState<"fast" | "full" | null>(null);
-  const [refreshAfterMs, setRefreshAfterMs] = useState<number | null>(null);
   // Chart only loads when user explicitly clicks a ticker row
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -909,6 +908,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
   const lastUserActivityAtRef = useRef<number>(Date.now());
   const lastFullFetchAtRef = useRef<number>(0);
+  const inFlightDeltaRef = useRef<boolean>(false);
+  const lastKlineWaveAtRef = useRef<number>(0);
+  const sortHydrationCountByKeyRef = useRef<Map<string, number>>(new Map());
   const IDLE_PAUSE_MS = 3 * 60_000; // Pause background Vercel HTTP polling after 3m of no mouse/scroll/keyboard activity
 
   const isClientActiveForPolling = useCallback(() => {
@@ -919,11 +921,16 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
   const fetchScreenerData = useCallback(
     async (extraSyms: string[] = []) => {
       const isPartialDelta = extraSyms.length > 0;
+      if (isPartialDelta) {
+        if (inFlightDeltaRef.current) return;
+        inFlightDeltaRef.current = true;
+      }
       try {
         if (!isPartialDelta) {
           setRefreshing(true);
           lastFullFetchAtRef.current = Date.now();
         }
+        lastKlineWaveAtRef.current = Date.now();
         const params = new URLSearchParams();
         if (isPartialDelta) {
           params.set("symbols", extraSyms.join(","));
@@ -935,17 +942,27 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const payload = (await res.json()) as ScreenerPayload;
         const now = Date.now();
+        lastKlineWaveAtRef.current = now;
         const cache = enrichedRowsCacheRef.current;
-        const KLINE_CACHE_TTL_MS = 300_000; // 5-minute client kline cache TTL (re-anchored live via WebSocket)
+        const KLINE_CACHE_TTL_MS = 180_000; // 3-minute client kline cache TTL (matches server TTL & re-anchored live via WebSocket)
 
         if (isPartialDelta) {
+          const hydratedSet = new Set<string>();
           if (payload.rows.length > 0) {
             const deltaMap = new Map<string, Row>();
             for (const r of payload.rows) {
               if (r.hasKlines !== false) {
                 cache.set(r.symbol, { at: now, row: r });
+                requestedKlinesRef.current.set(r.symbol, now);
+                hydratedSet.add(r.symbol);
               }
               deltaMap.set(r.symbol, r);
+            }
+            for (const reqSym of extraSyms) {
+              if (!hydratedSet.has(reqSym)) {
+                // Allow retry in ~3.5s if symbol was not hydrated in this wave
+                requestedKlinesRef.current.set(reqSym, now - (KLINE_CACHE_TTL_MS - 3_500));
+              }
             }
             try {
               const entriesToSave = [...cache.entries()]
@@ -959,6 +976,20 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             } catch {
               // Ignore sessionStorage quota errors
             }
+            // Clear stale WebSocket patches older than payload.asOf for the newly hydrated symbols
+            // so older ticks never overwrite fresh server 5m..12h calculations.
+            setLivePatches((prev) => {
+              let changed = false;
+              const next: Record<string, LiveTickPatch> = {};
+              for (const [k, v] of Object.entries(prev)) {
+                if (deltaMap.has(k) && v.updatedAt <= payload.asOf) {
+                  changed = true;
+                  continue;
+                }
+                next[k] = v;
+              }
+              return changed ? next : prev;
+            });
             setData((prev) => {
               if (!prev) return prev;
               const nextRows = prev.rows.map((r) => deltaMap.get(r.symbol) ?? r);
@@ -969,6 +1000,10 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 klineSymbolsCount,
               };
             });
+          } else {
+            for (const reqSym of extraSyms) {
+              requestedKlinesRef.current.set(reqSym, now - (KLINE_CACHE_TTL_MS - 3_500));
+            }
           }
           return;
         }
@@ -1059,15 +1094,21 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         });
         setWarning(payload.warning ?? null);
         setQuality(payload.quality ?? null);
-        setRefreshAfterMs(payload.nextRefreshMs ?? null);
         setError(null);
       } catch (e) {
-        if (!isPartialDelta) {
+        if (isPartialDelta) {
+          const retryBase = Date.now() - (180_000 - 3_500);
+          for (const reqSym of extraSyms) {
+            requestedKlinesRef.current.set(reqSym, retryBase);
+          }
+        } else {
           setError(e instanceof Error ? e.message : "Failed to load screener");
           setWarning(null);
         }
       } finally {
-        if (!isPartialDelta) {
+        if (isPartialDelta) {
+          inFlightDeltaRef.current = false;
+        } else {
           setLoading(false);
           setRefreshing(false);
         }
@@ -1123,6 +1164,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     setLoading(true);
     setLivePatches({});
     requestedKlinesRef.current.clear();
+    sortHydrationCountByKeyRef.current.clear();
     enrichedRowsCacheRef.current.clear();
     try {
       const raw = window.sessionStorage.getItem(`mexc-screener-kline-cache-v1:${exchange}`);
@@ -1131,7 +1173,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         const now = Date.now();
         if (Array.isArray(parsed)) {
           for (const [sym, entry] of parsed) {
-            if (entry && typeof entry.at === "number" && now - entry.at <= 300_000 && entry.row) {
+            if (entry && typeof entry.at === "number" && now - entry.at <= 180_000 && entry.row) {
               enrichedRowsCacheRef.current.set(sym, entry);
             }
           }
@@ -1150,15 +1192,6 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     }, 45_000);
     return () => clearInterval(timer);
   }, [exchange, fetchScreenerData, isClientActiveForPolling]);
-
-  // Fast-mode follow-up fetch
-  useEffect(() => {
-    if (quality !== "fast" || !refreshAfterMs) return;
-    const timer = setTimeout(() => {
-      void fetchScreenerData();
-    }, refreshAfterMs);
-    return () => clearTimeout(timer);
-  }, [quality, refreshAfterMs, fetchScreenerData]);
 
   // On-demand kline enrichment if user selects a symbol that doesn't have klines yet
   useEffect(() => {
@@ -1400,7 +1433,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 const last = arr[arr.length - 1];
                 if (!last || now - last.ts >= 10_000) {
                   arr.push({ ts: now, price: p.price });
-                  if (arr.length > 96) arr.shift();
+                  if (arr.length > 360) arr.shift();
                 }
               }
             }
@@ -1478,21 +1511,39 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
       let chg5mPct = reanchorPct(row.changePct["5m"]);
       let chg5mUsd = row.changeUsd["5m"] !== null ? row.changeUsd["5m"] + tickDeltaUsd : null;
+      let chg15mPct = reanchorPct(row.changePct["15m"]);
+      let chg15mUsd = row.changeUsd["15m"] !== null ? row.changeUsd["15m"] + tickDeltaUsd : null;
+      let chg1hPct = reanchorPct(row.changePct["1h"]);
+      let chg1hUsd = row.changeUsd["1h"] !== null ? row.changeUsd["1h"] + tickDeltaUsd : null;
       const symHist = histMap.get(row.symbol);
       if (symHist && symHist.length >= 2) {
-        const target5mTs = patch.updatedAt - 300_000;
-        let best5m: { ts: number; price: number } | null = null;
-        let bestDiff = Infinity;
-        for (const pt of symHist) {
-          const d = Math.abs(pt.ts - target5mTs);
-          if (d < bestDiff) {
-            bestDiff = d;
-            best5m = pt;
+        const findHistAnchor = (windowMs: number, maxToleranceMs: number) => {
+          const targetTs = patch.updatedAt - windowMs;
+          let best: { ts: number; price: number } | null = null;
+          let bestDiff = Infinity;
+          for (const pt of symHist) {
+            const d = Math.abs(pt.ts - targetTs);
+            if (d < bestDiff) {
+              bestDiff = d;
+              best = pt;
+            }
           }
+          return best && bestDiff <= maxToleranceMs && best.price > 0 ? best.price : null;
+        };
+        const p5 = findHistAnchor(300_000, 45_000);
+        if (p5 !== null) {
+          chg5mPct = ((patch.price - p5) / p5) * 100;
+          chg5mUsd = patch.price - p5;
         }
-        if (best5m && bestDiff <= 45_000 && best5m.price > 0) {
-          chg5mPct = ((patch.price - best5m.price) / best5m.price) * 100;
-          chg5mUsd = patch.price - best5m.price;
+        const p15 = findHistAnchor(900_000, 90_000);
+        if (p15 !== null) {
+          chg15mPct = ((patch.price - p15) / p15) * 100;
+          chg15mUsd = patch.price - p15;
+        }
+        const p1h = findHistAnchor(3_600_000, 240_000);
+        if (p1h !== null) {
+          chg1hPct = ((patch.price - p1h) / p1h) * 100;
+          chg1hUsd = patch.price - p1h;
         }
       }
 
@@ -1509,8 +1560,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         changePct: {
           ...row.changePct,
           "5m": chg5mPct,
-          "15m": reanchorPct(row.changePct["15m"]),
-          "1h": reanchorPct(row.changePct["1h"]),
+          "15m": chg15mPct,
+          "1h": chg1hPct,
           "4h": reanchorPct(row.changePct["4h"]),
           "8h": reanchorPct(row.changePct["8h"]),
           "12h": reanchorPct(row.changePct["12h"]),
@@ -1519,8 +1570,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         changeUsd: {
           ...row.changeUsd,
           "5m": chg5mUsd,
-          "15m": row.changeUsd["15m"] !== null ? row.changeUsd["15m"] + tickDeltaUsd : null,
-          "1h": row.changeUsd["1h"] !== null ? row.changeUsd["1h"] + tickDeltaUsd : null,
+          "15m": chg15mUsd,
+          "1h": chg1hUsd,
           "4h": row.changeUsd["4h"] !== null ? row.changeUsd["4h"] + tickDeltaUsd : null,
           "8h": row.changeUsd["8h"] !== null ? row.changeUsd["8h"] + tickDeltaUsd : null,
           "12h": row.changeUsd["12h"] !== null ? row.changeUsd["12h"] + tickDeltaUsd : null,
@@ -2152,71 +2203,96 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       ? `${virtualItems[0].index}-${virtualItems[virtualItems.length - 1].index}`
       : "0-0";
 
-  // Immediately enrich 1m klines for currently visible viewport rows + top un-enriched rows in current sort order
-  // using lightweight partial=1 delta endpoint (fits within 1 burst window = ~220ms with zero rate-limit wait!)
+  const activeSortHydrationKey = `${exchange}:${sortBy}:${sortDir}:${JSON.stringify(enabledPresets)}:${effectiveManualFilters.length}`;
+
+  // Paced sequential multi-wave delta hydrator:
+  // 1. Hydrates currently visible viewport rows (0ms delay if rate-limit window is open, or 1.85s paced wave).
+  // 2. Hydrates the top 90 active rows in 17-symbol partial=1 delta waves (~20 KB each) and stops completely once hydrated.
+  // 3. When sorting/filtering by any sub-24h column (5m, 15m, 1h, 4h, 8h, 12h, Vol, OI CHG, RVOL, Trades, CVD, Corr),
+  //    also hydrates the first 34 un-enriched candidate rows beyond the preferVerifiedKlines partition so true top movers surface immediately.
   useEffect(() => {
     if (!rows.length || !isClientActiveForPolling()) return;
+    if (inFlightDeltaRef.current) return;
+
     const now = Date.now();
     const maxBatch = exchange === "mexc" ? 17 : 22;
     const candidateSymbols = new Set<string>();
     const candidateRows: Row[] = [];
+    let viewportNeedsHydration = false;
 
+    const isEligible = (r: Row | undefined) => {
+      if (!r || r.hasKlines !== false || candidateSymbols.has(r.symbol)) return false;
+      const lastReq = requestedKlinesRef.current.get(r.symbol) ?? 0;
+      return now - lastReq > 180_000;
+    };
+
+    // Priority 1: Visible viewport rows
     for (const vItem of rowVirtualizer.getVirtualItems()) {
       const r = rows[vItem.index];
-      if (r && r.hasKlines === false && !candidateSymbols.has(r.symbol)) {
+      if (isEligible(r)) {
         candidateSymbols.add(r.symbol);
         candidateRows.push(r);
+        viewportNeedsHydration = true;
       }
     }
-    // Also include the first un-enriched rows within the top 54 sorted rows so that even when preferVerifiedKlines
-    // places existing hasKlines:true rows at 0..17, the next top movers immediately hydrate without waiting for a timer.
-    for (const r of rows.slice(0, 54)) {
-      if (r && r.hasKlines === false && !candidateSymbols.has(r.symbol)) {
+
+    // Priority 2: Top 90 rows of the active table
+    for (const r of rows.slice(0, 90)) {
+      if (isEligible(r)) {
         candidateSymbols.add(r.symbol);
         candidateRows.push(r);
       }
     }
 
-    const missingTop = candidateRows
-      .filter((r) => {
-        const lastReq = requestedKlinesRef.current.get(r.symbol) ?? 0;
-        return now - lastReq > 120_000;
-      })
-      .slice(0, maxBatch)
-      .map((r) => r.symbol);
+    // Priority 3: When sorted/filtered by a kline-dependent metric (5m, 15m, 1h, 4h, 8h, 12h, etc.),
+    // preferVerifiedKlines places existing hasKlines:true rows first, so the #1 un-enriched mover for the new sort
+    // may sit just after index 90. Hydrate up to 34 un-enriched top candidates for each distinct sort/filter selection.
+    const alreadyHydratedForSort = sortHydrationCountByKeyRef.current.get(activeSortHydrationKey) ?? 0;
+    if (alreadyHydratedForSort < 34) {
+      let addedFromSortTail = 0;
+      for (const r of rows) {
+        if (isEligible(r)) {
+          candidateSymbols.add(r.symbol);
+          candidateRows.push(r);
+          addedFromSortTail++;
+          if (addedFromSortTail >= 34 - alreadyHydratedForSort) break;
+        }
+      }
+    }
+
+    const missingTop = candidateRows.slice(0, maxBatch).map((r) => r.symbol);
     if (missingTop.length === 0) return;
-    for (const sym of missingTop) {
-      requestedKlinesRef.current.set(sym, now);
-    }
-    void fetchScreenerData(missingTop);
-  }, [exchange, rows, virtualRangeKey, rowVirtualizer, fetchScreenerData, isClientActiveForPolling]);
 
-  // Quota-friendly background kline warmer: warms only the top 60 sorted rows (not all 1,090) in lightweight partial=1 delta batches
-  // every 18s ONLY while the user is actively interacting with the tab, with a 5-minute per-symbol cooldown.
-  const latestRowsForWarmingRef = useRef<Row[]>([]);
-  latestRowsForWarmingRef.current = rows;
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (!isClientActiveForPolling()) return;
-      const currentRows = latestRowsForWarmingRef.current.slice(0, 60);
-      if (!currentRows.length) return;
-      const now = Date.now();
-      const batch: string[] = [];
-      for (const r of currentRows) {
-        if (r.hasKlines !== false) continue;
-        const lastReq = requestedKlinesRef.current.get(r.symbol) ?? 0;
-        if (now - lastReq <= 300_000) continue;
-        batch.push(r.symbol);
-        if (batch.length >= 20) break;
+    const minWaveGapMs = exchange === "mexc" ? 1_850 : 550;
+    const elapsedSinceLastWave = now - lastKlineWaveAtRef.current;
+    const delayMs =
+      viewportNeedsHydration && elapsedSinceLastWave >= minWaveGapMs
+        ? 15
+        : Math.max(25, minWaveGapMs - elapsedSinceLastWave);
+
+    const timer = setTimeout(() => {
+      if (inFlightDeltaRef.current || !isClientActiveForPolling()) return;
+      const fireNow = Date.now();
+      for (const sym of missingTop) {
+        requestedKlinesRef.current.set(sym, fireNow);
       }
-      if (batch.length === 0) return;
-      for (const sym of batch) {
-        requestedKlinesRef.current.set(sym, now);
-      }
-      void fetchScreenerData(batch);
-    }, 18_000);
-    return () => clearInterval(timer);
-  }, [exchange, fetchScreenerData, isClientActiveForPolling]);
+      sortHydrationCountByKeyRef.current.set(
+        activeSortHydrationKey,
+        (sortHydrationCountByKeyRef.current.get(activeSortHydrationKey) ?? 0) + missingTop.length,
+      );
+      void fetchScreenerData(missingTop);
+    }, delayMs);
+
+    return () => clearTimeout(timer);
+  }, [
+    exchange,
+    rows,
+    virtualRangeKey,
+    activeSortHydrationKey,
+    rowVirtualizer,
+    fetchScreenerData,
+    isClientActiveForPolling,
+  ]);
 
   // Measure the open inline dropdown row directly so itemSizeCache always matches its exact expanded DOM height
   // even while smooth scrolling is in progress, while collapsed rows always use their exact 36px height.
