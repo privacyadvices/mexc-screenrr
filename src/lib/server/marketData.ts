@@ -78,6 +78,7 @@ export type NormalizedTicker = {
   priceScale?: number;
   contractSize?: number;
   amount24: number;
+  trades24h?: number | null;
   fundingRate: number;
   fundingIntervalHours?: number;
   fundingRate1h?: number | null;
@@ -144,13 +145,24 @@ let binanceFundingIntervalCache = new Map<string, number>();
 let binanceFundingIntervalCachedAt = 0;
 let binanceFundingIntervalInFlight: Promise<Map<string, number>> | null = null;
 
-let binanceOnboardCache = new Map<string, { onboardDate: number; priceScale?: number }>();
+type BinanceOnboardMeta = {
+  onboardDate: number;
+  priceScale?: number;
+  sectors: string[];
+};
+let binanceOnboardCache = new Map<string, BinanceOnboardMeta>();
 let binanceOnboardCachedAt = 0;
-let binanceOnboardInFlight: Promise<Map<string, { onboardDate: number; priceScale?: number }>> | null = null;
+let binanceOnboardInFlight: Promise<Map<string, BinanceOnboardMeta>> | null = null;
 
-let bybitLaunchCache = new Map<string, { launchTime: number; priceScale?: number; maxLeverage?: number }>();
+type BybitInstrumentMeta = {
+  launchTime: number;
+  priceScale?: number;
+  maxLeverage?: number;
+  sectors: string[];
+};
+let bybitLaunchCache = new Map<string, BybitInstrumentMeta>();
 let bybitLaunchCachedAt = 0;
-let bybitLaunchInFlight: Promise<Map<string, { launchTime: number; priceScale?: number; maxLeverage?: number }>> | null = null;
+let bybitLaunchInFlight: Promise<Map<string, BybitInstrumentMeta>> | null = null;
 
 type GateContractMeta = {
   launchTime: number;
@@ -159,6 +171,7 @@ type GateContractMeta = {
   fundingIntervalHours: number;
   contractSize: number;
   inDelisting: boolean;
+  sectors: string[];
 };
 let gateContractCache = new Map<string, GateContractMeta>();
 let gateContractCachedAt = 0;
@@ -197,7 +210,9 @@ export function normalizeBaseSymbol(raw: string): string {
 }
 
 export function stripMultiplierPrefix(baseKey: string): string {
-  return baseKey.replace(/^(10000000|1000000|100000|10000|1000|100)(?=[a-z]{2,})/i, "");
+  return baseKey
+    .replace(/^(10000000|1000000|100000|10000|1000|100)(?=[a-z]{2,})/i, "")
+    .replace(/(?<=[a-z]{3,})1000$/i, "");
 }
 
 export function lookupMcap(mcapMap: Map<string, number>, symbol: string): number | null {
@@ -238,6 +253,17 @@ export function lookupCoinSectors(symbol: string): string[] {
     return ["stock", "usstocks", "tradfi"];
   }
   return [];
+}
+
+function mergeSectors(...lists: Array<string[] | undefined>): string[] {
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!list) continue;
+    for (const s of list) {
+      if (s && !out.includes(s)) out.push(s);
+    }
+  }
+  return out;
 }
 
 async function ensureDiskSnapshotsLoaded(): Promise<void> {
@@ -425,9 +451,84 @@ export async function fetchMexcContractDetailsMap(forceRefresh = false): Promise
   return mexcDetailInFlight;
 }
 
+function parseBinanceSectors(sym: string, contractType?: string, underlyingSubType?: string[]): string[] {
+  const sectors: string[] = [];
+  const add = (s: string) => {
+    if (s && !sectors.includes(s)) sectors.push(s);
+  };
+  const base = sym.replace(/USDT$/i, "").toUpperCase();
+  const isMetal = /^(XAU|XAG|XPT|XPD|COPPER|GOLD|SILVER)$/i.test(base);
+  const isEnergy = /^(CL|BZ|NATGAS|WTI|BRENT|OIL)$/i.test(base);
+  const isForex = /^(USDBRL|USDEX|(EUR|GBP|JPY|AUD|CAD|CHF|CNH|TRY|MXN|ZAR)(USD)?)$/i.test(base);
+
+  if (isMetal) {
+    add("metals");
+    add("commodities");
+    add("tradfi");
+  }
+  if (isEnergy) {
+    add("oil");
+    add("commodities");
+    add("tradfi");
+  }
+  if (isForex) {
+    add("forex");
+    add("tradfi");
+  }
+
+  const subTypes = Array.isArray(underlyingSubType) ? underlyingSubType : [];
+  const isTradFi = contractType === "TRADIFI_PERPETUAL" || subTypes.some((u) => /^tradfi$/i.test(String(u)));
+  if (isTradFi) {
+    add("tradfi");
+    if (!isMetal && !isEnergy && !isForex) {
+      if (
+        /^(HK\d+|BYD|TENCENT|MEITUAN|KUAISHOU|POPMART|XIAOMI|LENOVO|SMIC|GIGADEV|GIGADEVICE|MINIMAX|ZHIPU|CSOPSAMSUNG2L|CSOPSKHYNIX2L)$/i.test(
+          base,
+        )
+      ) {
+        add("hkstocks");
+      } else if (
+        /^(SKHYNIX|SKHY|SKUU|SKDD|SAMSUNG|SAMSUNGEM|HYUNDAI|HANMI|LGELECTRONICS|NAVER|KODEX200)$/i.test(base)
+      ) {
+        add("krstocks");
+      } else if (/^(ZHONGJI|CXMT|UNITREE)$/i.test(base)) {
+        add("cnstocks");
+      } else if (/^(SPX|NAS|NDX|DJI|US30|US500|US100|RUSSELL|VIX)/i.test(base)) {
+        add("stockindex");
+        add("usstocks");
+        add("stock");
+      } else if (
+        /^(SPY|QQQ|IWM|DIA|TLT|GLD|SLV|ARKK|SOXL|SOXS|TQQQ|SQQQ|XLF|XLE|XLK|EEM|EWJ|EWT|EWY|EWZ|EWZS|FXI|KWEB|IBIT|ETHA|GDX|URNM|UVXY|TMF|TBT|BITO|SMH|XBI)$/i.test(
+          base,
+        )
+      ) {
+        add("etf");
+        add("usstocks");
+        add("stock");
+      } else {
+        add("usstocks");
+        add("stock");
+      }
+    }
+  }
+
+  for (const rawSub of subTypes) {
+    const sub = String(rawSub ?? "").trim();
+    if (!sub || /^tradfi$/i.test(sub)) continue;
+    if (/^pre-?ipo$/i.test(sub)) {
+      add("preipo");
+      add("tradfi");
+    } else {
+      add(sub.toLowerCase().replace(/\s+/g, "-"));
+    }
+  }
+
+  return sectors;
+}
+
 async function fetchBinanceOnboardMap(
   forceRefresh = false,
-): Promise<Map<string, { onboardDate: number; priceScale?: number }>> {
+): Promise<Map<string, BinanceOnboardMeta>> {
   const now = Date.now();
   if (
     binanceOnboardCache.size &&
@@ -439,17 +540,25 @@ async function fetchBinanceOnboardMap(
     binanceOnboardInFlight = (async () => {
       try {
         const info = await binanceFetch<{
-          symbols?: Array<{ symbol?: string; onboardDate?: number; pricePrecision?: number }>;
+          symbols?: Array<{
+            symbol?: string;
+            onboardDate?: number;
+            pricePrecision?: number;
+            contractType?: string;
+            underlyingSubType?: string[];
+          }>;
         }>("/fapi/v1/exchangeInfo");
-        const map = new Map<string, { onboardDate: number; priceScale?: number }>();
+        const map = new Map<string, BinanceOnboardMeta>();
         for (const s of info.symbols ?? []) {
           const sym = String(s.symbol ?? "");
           if (!sym) continue;
           const onboardDate = Number(s.onboardDate ?? 0);
           const priceScale = Number(s.pricePrecision);
+          const sectors = parseBinanceSectors(sym, s.contractType, s.underlyingSubType);
           map.set(sym, {
             onboardDate: Number.isFinite(onboardDate) ? onboardDate : 0,
             priceScale: Number.isFinite(priceScale) && priceScale >= 0 ? priceScale : undefined,
+            sectors,
           });
         }
         if (map.size > 0) {
@@ -467,9 +576,68 @@ async function fetchBinanceOnboardMap(
   return binanceOnboardInFlight;
 }
 
+function parseBybitSectors(sym: string, symbolType?: string, marketRegion?: string, status?: string): string[] {
+  const sectors: string[] = [];
+  const add = (s: string) => {
+    if (s && !sectors.includes(s)) sectors.push(s);
+  };
+  const rawType = String(symbolType ?? "").trim();
+  const region = String(marketRegion ?? "").trim().toUpperCase();
+  const st = rawType.includes(":") ? rawType : region ? `${rawType}:${region}` : rawType;
+
+  if (st === "stock:US" || st === "stock") {
+    add("stock");
+    add("usstocks");
+    add("tradfi");
+  } else if (st === "ETF:US" || st === "ETF") {
+    add("etf");
+    add("stock");
+    add("usstocks");
+    add("tradfi");
+  } else if (st === "stock:HK" || st === "ETF:HK") {
+    add("hkstocks");
+    add("tradfi");
+  } else if (st === "stock:KR" || st === "ETF:KR") {
+    add("krstocks");
+    add("tradfi");
+  } else if (st === "stock:CN" || st === "ETF:CN") {
+    add("cnstocks");
+    add("tradfi");
+  } else if (st === "stock:JP" || st === "ETF:JP") {
+    add("jpstocks");
+    add("tradfi");
+  } else if (st === "stock:TW" || st === "ETF:TW") {
+    add("twstocks");
+    add("tradfi");
+  } else if (rawType === "commodity") {
+    const base = sym.replace(/USDT$/i, "").toUpperCase();
+    if (/^(XAU|XAG|XPT|XPD|COPPER|GOLD|SILVER)/i.test(base)) {
+      add("metals");
+    } else if (/^(CL|BZ|WTI|BRENT|NATGAS|OIL)/i.test(base)) {
+      add("oil");
+    }
+    add("commodities");
+    add("tradfi");
+  } else if (rawType === "forex") {
+    add("forex");
+    add("tradfi");
+  } else if (rawType === "innovation") {
+    add("innovation");
+  }
+
+  if (
+    status === "PreLaunch" &&
+    /^(ANTHROPIC|OPENAI|SPACEX|STRIPE|DATABRICKS|DISCORD|REVOLUT|KRAKEN)USDT$/i.test(sym)
+  ) {
+    add("preipo");
+    add("tradfi");
+  }
+  return sectors;
+}
+
 async function fetchBybitLaunchMap(
   forceRefresh = false,
-): Promise<Map<string, { launchTime: number; priceScale?: number; maxLeverage?: number }>> {
+): Promise<Map<string, BybitInstrumentMeta>> {
   const now = Date.now();
   if (
     bybitLaunchCache.size &&
@@ -480,25 +648,34 @@ async function fetchBybitLaunchMap(
   if (!bybitLaunchInFlight) {
     bybitLaunchInFlight = (async () => {
       try {
-        const res = await bybitFetch<{
-          list?: Array<{
-            symbol?: string;
-            launchTime?: string;
-            priceScale?: string;
-            leverageFilter?: { maxLeverage?: string };
-          }>;
-        }>("/v5/market/instruments-info?category=linear&limit=1000");
-        const map = new Map<string, { launchTime: number; priceScale?: number; maxLeverage?: number }>();
-        for (const item of res.list ?? []) {
+        type BybitInstRow = {
+          symbol?: string;
+          launchTime?: string;
+          priceScale?: string;
+          symbolType?: string;
+          marketRegion?: string;
+          status?: string;
+          leverageFilter?: { maxLeverage?: string };
+        };
+        const [resTrading, resPreLaunch] = await Promise.all([
+          bybitFetch<{ list?: BybitInstRow[] }>("/v5/market/instruments-info?category=linear&limit=1000"),
+          bybitFetch<{ list?: BybitInstRow[] }>(
+            "/v5/market/instruments-info?category=linear&status=PreLaunch&limit=1000",
+          ).catch(() => ({ list: [] as BybitInstRow[] })),
+        ]);
+        const map = new Map<string, BybitInstrumentMeta>();
+        for (const item of [...(resTrading.list ?? []), ...(resPreLaunch.list ?? [])]) {
           const sym = String(item.symbol ?? "");
           if (!sym) continue;
           const launchTime = Number(item.launchTime ?? 0);
           const priceScale = Number(item.priceScale);
           const maxLev = Number(item.leverageFilter?.maxLeverage);
+          const sectors = parseBybitSectors(sym, item.symbolType, item.marketRegion, item.status);
           map.set(sym, {
             launchTime: Number.isFinite(launchTime) ? launchTime : 0,
             priceScale: Number.isFinite(priceScale) && priceScale >= 0 ? priceScale : undefined,
             maxLeverage: Number.isFinite(maxLev) && maxLev > 0 ? maxLev : undefined,
+            sectors,
           });
         }
         if (map.size > 0) {
@@ -514,6 +691,54 @@ async function fetchBybitLaunchMap(
     });
   }
   return bybitLaunchInFlight;
+}
+
+function parseGateSectors(sym: string, contractType?: string): string[] {
+  const sectors: string[] = [];
+  const add = (s: string) => {
+    if (s && !sectors.includes(s)) sectors.push(s);
+  };
+  const ct = String(contractType ?? "").trim().toLowerCase();
+  const base = sym.replace(/_USDT$/i, "").toUpperCase();
+  if (ct === "stocks") {
+    add("stock");
+    add("usstocks");
+    add("tradfi");
+  } else if (ct === "indices") {
+    if (/^(BVOL|EVOL)$/i.test(base)) {
+      return sectors;
+    }
+    if (/^(NAS100|SPX500|US30|US2000|NDX|DJI|SP500|RUSSELL|VOLX)/i.test(base)) {
+      add("stockindex");
+      add("usstocks");
+      add("stock");
+    } else if (/^(HK50|HSCHKD)/i.test(base)) {
+      add("hkstocks");
+    } else if (/^JPN225/i.test(base)) {
+      add("jpstocks");
+    } else if (/^KR200/i.test(base)) {
+      add("krstocks");
+    } else if (/^TW88/i.test(base)) {
+      add("twstocks");
+    }
+    add("tradfi");
+  } else if (ct === "metals") {
+    add("metals");
+    add("commodities");
+    add("tradfi");
+  } else if (ct === "forex") {
+    if (base !== "USDC" && base !== "USDT") {
+      add("forex");
+      add("tradfi");
+    }
+  } else if (ct === "commodities") {
+    if (/^(CL|BZ|WTI|BRENT|NATGAS|NG|OIL|USO)$/i.test(base)) {
+      add("oil");
+    }
+    add("commodities");
+    add("tradfi");
+  }
+  return sectors;
 }
 
 async function fetchGateContractMetaMap(forceRefresh = false): Promise<Map<string, GateContractMeta>> {
@@ -543,6 +768,7 @@ async function fetchGateContractMetaMap(forceRefresh = false): Promise<Map<strin
           quanto_multiplier?: string | number;
           in_delisting?: boolean;
           status?: string;
+          contract_type?: string;
         }>;
         const map = new Map<string, GateContractMeta>();
         for (const item of Array.isArray(list) ? list : []) {
@@ -562,6 +788,7 @@ async function fetchGateContractMetaMap(forceRefresh = false): Promise<Map<strin
           const contractSize = Number(item.quanto_multiplier);
           const inDelisting =
             Boolean(item.in_delisting) || (typeof item.status === "string" && item.status !== "trading");
+          const sectors = parseGateSectors(sym, item.contract_type);
           map.set(sym, {
             launchTime: Number.isFinite(launchTime) ? launchTime : 0,
             priceScale,
@@ -569,6 +796,7 @@ async function fetchGateContractMetaMap(forceRefresh = false): Promise<Map<strin
             fundingIntervalHours,
             contractSize: Number.isFinite(contractSize) && contractSize > 0 ? contractSize : 1,
             inDelisting,
+            sectors,
           });
         }
         if (map.size > 0) {
@@ -664,9 +892,17 @@ async function refreshBinanceOiBatch(symbols: string[]): Promise<void> {
   const now = Date.now();
   const stale = symbols.filter((s) => {
     const c = binanceOiCache.get(s);
-    return !c || now - c.at > 90_000;
+    return !c || now - c.at > 240_000;
   });
-  const batch = stale.slice(0, 10);
+  stale.sort((a, b) => {
+    const ca = binanceOiCache.get(a);
+    const cb = binanceOiCache.get(b);
+    if (!ca && !cb) return 0;
+    if (!ca) return -1;
+    if (!cb) return 1;
+    return ca.at - cb.at;
+  });
+  const batch = stale.slice(0, 28);
   if (!batch.length) return;
   await Promise.all(
     batch.map(async (symbol) => {
@@ -681,6 +917,19 @@ async function refreshBinanceOiBatch(symbols: string[]): Promise<void> {
       }
     }),
   );
+}
+
+function backfillBinanceTickerOi(tickers: NormalizedTicker[]): void {
+  const lastSnap = oiHistoryByExchange.get("binance")?.at(-1);
+  for (const t of tickers) {
+    const cachedOi = binanceOiCache.get(t.symbol);
+    if (cachedOi && cachedOi.oiCoins > 0 && t.price > 0) {
+      t.oiUsd = cachedOi.oiCoins * t.price;
+      if (lastSnap && !lastSnap.oi[t.symbol]) {
+        lastSnap.oi[t.symbol] = Math.round(t.oiUsd);
+      }
+    }
+  }
 }
 
 export async function fetchMcapMap(): Promise<Map<string, number>> {
@@ -992,6 +1241,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
           highPrice: string;
           lowPrice: string;
           quoteVolume: string;
+          count?: number | string;
         }>
       >("/fapi/v1/ticker/24hr"),
       binanceFetch<
@@ -1035,6 +1285,11 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
       const price = Number(t.lastPrice);
       const high24 = Number(t.highPrice);
       const low24 = Number(t.lowPrice);
+      const rawTrades24h = Number(t.count);
+      const trades24h =
+        t.count !== undefined && Number.isFinite(rawTrades24h) && rawTrades24h > 0
+          ? Math.round(rawTrades24h)
+          : null;
       const prem = premMap.get(t.symbol);
       const fundingRate = prem?.funding ?? 0;
       const fundingIntervalHours = fundingIntervals.get(t.symbol) ?? 8;
@@ -1055,6 +1310,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         price,
         priceScale: meta?.priceScale,
         amount24: Number(t.quoteVolume) || 0,
+        trades24h,
         fundingRate,
         fundingIntervalHours,
         fundingRate1h,
@@ -1067,7 +1323,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         high24Price: high24 > 0 ? high24 : null,
         low24Price: low24 > 0 ? low24 : null,
         isNew,
-        sectors: lookupCoinSectors(t.symbol),
+        sectors: mergeSectors(meta?.sectors, lookupCoinSectors(t.symbol)),
         iconUrl: lookupCoinIcon(t.symbol),
       };
     });
@@ -1250,7 +1506,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
           high24Price: high24 > 0 ? high24 : null,
           low24Price: low24 > 0 ? low24 : null,
           isNew,
-          sectors: lookupCoinSectors(symbol),
+          sectors: mergeSectors(meta?.sectors, lookupCoinSectors(symbol)),
           iconUrl: lookupCoinIcon(symbol),
         };
       })
@@ -1341,7 +1597,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         high24Price: high24 > 0 ? high24 : null,
         low24Price: low24 > 0 ? low24 : null,
         isNew,
-        sectors: lookupCoinSectors(t.symbol),
+        sectors: mergeSectors(meta?.sectors, lookupCoinSectors(t.symbol)),
         iconUrl: lookupCoinIcon(t.symbol),
       };
     })
@@ -2188,7 +2444,15 @@ function isStockOrTradFiTicker(t: NormalizedTicker): boolean {
       s === "etf" ||
       s === "jpstocks" ||
       s === "twstocks" ||
-      s === "hkstocks",
+      s === "hkstocks" ||
+      s === "krstocks" ||
+      s === "cnstocks" ||
+      s === "commodities" ||
+      s === "metals" ||
+      s === "metalsfutures" ||
+      s === "forex" ||
+      s === "oil" ||
+      s === "preipo",
   );
 }
 
@@ -2408,7 +2672,7 @@ function composeScreenerRows(
         if (snapOi.pct !== null && snapOi.usd !== null && Math.abs(snapOi.pct) > 0.0001) {
           oiChangePctMap[tf] = snapOi.pct;
           oiChangeUsdMap[tf] = snapOi.usd;
-        } else {
+        } else if (oiUsd && oiUsd > 0) {
           const snapOi5 = lookupSnapshotOiChange(exchange, ticker.symbol, oiUsd, ticker.price, "5m");
           const chgTerm = cPct * 0.36;
           const estOiPct =
@@ -2417,8 +2681,11 @@ function composeScreenerRows(
                 chgTerm +
                 (symFactor - 1) * Math.log2(mins / 5 + 1)
               : chgTerm + (symFactor - 1) * Math.log2(mins / 5 + 1);
-          oiChangePctMap[tf] = oiUsd && oiUsd > 0 ? estOiPct : 0;
-          oiChangeUsdMap[tf] = oiUsd && oiUsd > 0 ? oiUsd * (estOiPct / 100) : 0;
+          oiChangePctMap[tf] = estOiPct;
+          oiChangeUsdMap[tf] = oiUsd * (estOiPct / 100);
+        } else {
+          oiChangePctMap[tf] = null;
+          oiChangeUsdMap[tf] = null;
         }
 
         // Keep synthetic activityBoost bounded (0.82 .. 1.16) so un-enriched contracts display realistic RVOL (~0.8x..1.15x)
@@ -2439,7 +2706,12 @@ function composeScreenerRows(
 
         const estHigh = ticker.price * (1 + (tfVolty * Math.sqrt(mins)) / 200);
         const estLow = Math.max(1e-12, ticker.price * (1 - (tfVolty * Math.sqrt(mins)) / 200));
-        tradesMap[tf] = vol24 > 0 ? calcTradesForBar(estVol, estHigh, estLow, ticker.price) : 0;
+        tradesMap[tf] =
+          tf === "1d" && ticker.trades24h !== undefined && ticker.trades24h !== null
+            ? ticker.trades24h
+            : vol24 > 0
+              ? calcTradesForBar(estVol, estHigh, estLow, ticker.price)
+              : 0;
 
         const deltaBias = Math.max(-0.82, Math.min(0.82, cPct / Math.max(0.35, tfVolty * Math.sqrt(mins))));
         cvdMap[tf] = estVol * deltaBias;
@@ -2512,7 +2784,7 @@ function composeScreenerRows(
     if (ticker.change24hUsd !== null) {
       perTf.changeUsd["1d"] = ticker.change24hUsd;
     }
-    // If kline depth is shorter than a multi-hour window (e.g. Bybit 1000m or newly listed pair), scale volume/trades/oiChangePct
+    // If kline depth is shorter than a multi-hour window (e.g. Bybit 1000m or newly listed pair), scale volume/trades/cvd
     const klineLen = kline.close.length;
     if (klineLen > 0 && klineLen < 1440) {
       for (const tf of ["4h", "8h", "12h", "1d"] as const) {
@@ -2527,6 +2799,28 @@ function composeScreenerRows(
             perTf.trades[tf] = Math.max(1, Math.round(perTf.trades[tf]! * (mins / klineLen)));
           }
         }
+      }
+      if (perTf.cvd["1d"] !== null) {
+        const scaledCvd1d = perTf.cvd["1d"] * (1440 / klineLen);
+        perTf.cvd["1d"] =
+          ticker.amount24 > 0
+            ? Math.max(-ticker.amount24, Math.min(ticker.amount24, scaledCvd1d))
+            : scaledCvd1d;
+      }
+    }
+    if (ticker.trades24h !== undefined && ticker.trades24h !== null && ticker.trades24h > 0) {
+      perTf.trades["1d"] = ticker.trades24h;
+    }
+    if (
+      perTf.volChangePct["12h"] === null &&
+      ticker.amount24 > 0 &&
+      perTf.volume["12h"] !== null &&
+      ticker.amount24 > perTf.volume["12h"]
+    ) {
+      const prev12hVol = ticker.amount24 - perTf.volume["12h"];
+      if (prev12hVol > 0) {
+        perTf.volChangeUsd["12h"] = perTf.volume["12h"] - prev12hVol;
+        perTf.volChangePct["12h"] = ((perTf.volume["12h"] - prev12hVol) / prev12hVol) * 100;
       }
     }
     if (
@@ -2624,10 +2918,6 @@ async function buildScreener(
   const prioritySymbols = selectPriorityKlineSymbols(exchange, tickers, targetLimit, extraSymbols);
   const priorityRankMap = new Map<string, number>(prioritySymbols.map((s, idx) => [s, idx]));
 
-  if (exchange === "binance" && extraSymbols.length > 0) {
-    await refreshBinanceOiBatch(extraSymbols);
-  }
-
   const now = Date.now();
   const klineMap = new Map<string, KlineData | null>();
 
@@ -2681,6 +2971,14 @@ async function buildScreener(
       ? 18
       : Math.max(baseSyncBatch, Math.min(28, extraSymbols.length + 4));
   const syncSymbols = needsFetch.slice(0, maxSyncBatch);
+
+  if (exchange === "binance") {
+    const oiTargets = [...new Set([...extraSymbols, ...syncSymbols])];
+    if (oiTargets.length > 0) {
+      await refreshBinanceOiBatch(oiTargets);
+    }
+    backfillBinanceTickerOi(tickers);
+  }
 
   const fetched = await fetchInBatches(
     syncSymbols,
@@ -2803,18 +3101,38 @@ export async function getScreenerPayload(
     if (exchange === "binance") {
       await refreshBinanceOiBatch(requestedSlice);
     }
-    const [tickers, mcapMap] = await Promise.all([
-      fetchTickers(exchange),
-      fetchMcapMap().catch(() => new Map<string, number>()),
-      toFetch.length > 0
-        ? fetchInBatches(
-            toFetch,
-            exchange === "mexc" ? 18 : 20,
-            async (symbol) => fetchKlineCached(exchange, symbol, KLINE_LIMIT),
-            25,
-          )
-        : Promise.resolve([]),
-    ]);
+    let tickers: NormalizedTicker[];
+    let mcapMap: Map<string, number>;
+    try {
+      [tickers, mcapMap] = await Promise.all([
+        fetchTickers(exchange),
+        fetchMcapMap().catch(() => new Map<string, number>()),
+        toFetch.length > 0
+          ? fetchInBatches(
+              toFetch,
+              exchange === "mexc" ? 18 : 20,
+              async (symbol) => fetchKlineCached(exchange, symbol, KLINE_LIMIT),
+              25,
+            )
+          : Promise.resolve([]),
+      ]);
+    } catch (err) {
+      if (cached) {
+        const fallbackRows = cached.payload.rows.filter((r) => requestedSet.has(r.symbol));
+        return {
+          asOf: cached.payload.asOf,
+          rows: fallbackRows,
+          totalContracts: cached.payload.totalContracts,
+          klineSymbolsCount: fallbackRows.filter((r) => r.hasKlines).length,
+          oiHistoryMinutes: cached.payload.oiHistoryMinutes,
+          quality: cached.payload.quality,
+        };
+      }
+      throw err;
+    }
+    if (exchange === "binance") {
+      backfillBinanceTickerOi(tickers);
+    }
     const refreshNow = Date.now();
     const targetTickers = tickers.filter((t) => requestedSet.has(t.symbol));
     const klineMap = new Map<string, KlineData | null>();
@@ -2826,7 +3144,19 @@ export async function getScreenerPayload(
         klineMap.set(t.symbol, c.data);
       }
     }
-    const deltaRows = composeScreenerRows(exchange, targetTickers, mcapMap, klineMap, btcKline);
+    const prevRowMap = cached ? new Map(cached.payload.rows.map((r) => [r.symbol, r])) : null;
+    const deltaRows = composeScreenerRows(exchange, targetTickers, mcapMap, klineMap, btcKline).map((d) => {
+      const prev = prevRowMap?.get(d.symbol);
+      if (d.oiUsd === null && prev?.oiUsd) {
+        return {
+          ...d,
+          oiUsd: prev.oiUsd,
+          oiToMcapPct: d.oiToMcapPct ?? prev.oiToMcapPct,
+          volToOi: d.volToOi ?? prev.volToOi,
+        };
+      }
+      return d;
+    });
     if (cached && deltaRows.length > 0) {
       const deltaMap = new Map(deltaRows.map((r) => [r.symbol, r]));
       const updatedRows = cached.payload.rows.map((r) => deltaMap.get(r.symbol) ?? r);
@@ -2878,6 +3208,9 @@ export async function getScreenerPayload(
         25,
       ),
     ]);
+    if (exchange === "binance") {
+      backfillBinanceTickerOi(tickers);
+    }
     const refreshNow = Date.now();
     const klineMap = new Map<string, KlineData | null>();
     for (const t of tickers) {
@@ -3002,7 +3335,13 @@ async function warmExchangeBatch(exchange: ExchangeId, batchSize: number): Promi
     .slice(0, batchSize);
 
   if (candidates.length > 0) {
+    if (exchange === "binance") {
+      await refreshBinanceOiBatch(candidates.map((c) => c.symbol));
+      backfillBinanceTickerOi(tickers);
+    }
     await Promise.all(candidates.map((c) => fetchKlineCached(exchange, c.symbol, KLINE_LIMIT)));
+  } else if (exchange === "binance") {
+    backfillBinanceTickerOi(tickers);
   }
 
   const mcapMap = await fetchMcapMap().catch(() => new Map<string, number>());

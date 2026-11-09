@@ -617,6 +617,8 @@ const TRADFI_SECTORS = new Set([
   "jpstocks",
   "twstocks",
   "hkstocks",
+  "krstocks",
+  "cnstocks",
   "commodities",
   "metalsfutures",
   "metals",
@@ -962,12 +964,22 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           if (payload.rows.length > 0) {
             const deltaMap = new Map<string, Row>();
             for (const r of payload.rows) {
-              if (r.hasKlines !== false) {
-                cache.set(r.symbol, { at: now, row: r });
-                requestedKlinesRef.current.set(r.symbol, now);
-                hydratedSet.add(r.symbol);
+              const existingCached = cache.get(r.symbol);
+              const mergedDeltaRow =
+                r.oiUsd === null && existingCached?.row.oiUsd
+                  ? {
+                      ...r,
+                      oiUsd: existingCached.row.oiUsd,
+                      oiToMcapPct: r.oiToMcapPct ?? existingCached.row.oiToMcapPct,
+                      volToOi: r.volToOi ?? existingCached.row.volToOi,
+                    }
+                  : r;
+              if (mergedDeltaRow.hasKlines !== false) {
+                cache.set(mergedDeltaRow.symbol, { at: now, row: mergedDeltaRow });
+                requestedKlinesRef.current.set(mergedDeltaRow.symbol, now);
+                hydratedSet.add(mergedDeltaRow.symbol);
               }
-              deltaMap.set(r.symbol, r);
+              deltaMap.set(mergedDeltaRow.symbol, mergedDeltaRow);
             }
             for (const reqSym of extraSyms) {
               if (!hydratedSet.has(reqSym)) {
@@ -1003,7 +1015,19 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             });
             setData((prev) => {
               if (!prev) return prev;
-              const nextRows = prev.rows.map((r) => deltaMap.get(r.symbol) ?? r);
+              const nextRows = prev.rows.map((r) => {
+                const d = deltaMap.get(r.symbol);
+                if (!d) return r;
+                if (d.oiUsd === null && r.oiUsd !== null) {
+                  return {
+                    ...d,
+                    oiUsd: r.oiUsd,
+                    oiToMcapPct: d.oiToMcapPct ?? r.oiToMcapPct,
+                    volToOi: d.volToOi ?? r.volToOi,
+                  };
+                }
+                return d;
+              });
               const klineSymbolsCount = nextRows.filter((r) => r.hasKlines !== false).length;
               return {
                 ...prev,
@@ -1024,8 +1048,17 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           if (r.hasKlines !== false) {
             const preservedAt =
               existingCached && now - existingCached.at < KLINE_CACHE_TTL_MS ? existingCached.at : now;
-            cache.set(r.symbol, { at: preservedAt, row: r });
-            return r;
+            const mergedR =
+              r.oiUsd === null && existingCached?.row.oiUsd
+                ? {
+                    ...r,
+                    oiUsd: existingCached.row.oiUsd,
+                    oiToMcapPct: r.oiToMcapPct ?? existingCached.row.oiToMcapPct,
+                    volToOi: r.volToOi ?? existingCached.row.volToOi,
+                  }
+                : r;
+            cache.set(r.symbol, { at: preservedAt, row: mergedR });
+            return mergedR;
           }
           const cached = existingCached;
           if (!cached || now - cached.at > KLINE_CACHE_TTL_MS) {
@@ -1045,7 +1078,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           return {
             ...cr,
             price: r.price,
-            oiUsd: r.oiUsd,
+            oiUsd: r.oiUsd ?? cr.oiUsd,
             funding: r.funding,
             fundingRate1h: r.fundingRate1h,
             fundingIntervalHours: r.fundingIntervalHours,
@@ -1054,8 +1087,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             high24Price: r.high24Price,
             low24Price: r.low24Price,
             mcap: r.mcap,
-            oiToMcapPct: r.oiToMcapPct,
-            volToOi: r.volToOi,
+            oiToMcapPct: r.oiToMcapPct ?? cr.oiToMcapPct,
+            volToOi: r.volToOi ?? cr.volToOi,
             isZeroFee: r.isZeroFee,
             isNew: r.isNew,
             isHot: r.isHot,
@@ -1250,7 +1283,22 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     let alive = true;
     let pendingPatches: Record<string, LiveTickPatch> = {};
     let pendingFlashes: Record<string, "up" | "down"> = {};
+    const bybitLastKnown: Record<string, { high24?: number; low24?: number; indexPrice?: number }> = {};
     let hasPending = false;
+
+    const stripUndefinedPatchKeys = (patch: LiveTickPatch): LiveTickPatch => {
+      const cleaned: LiveTickPatch = {
+        price: patch.price,
+        updatedAt: patch.updatedAt,
+      };
+      if (patch.amount24 !== undefined) cleaned.amount24 = patch.amount24;
+      if (patch.change24hPct !== undefined) cleaned.change24hPct = patch.change24hPct;
+      if (patch.basisPct !== undefined) cleaned.basisPct = patch.basisPct;
+      if (patch.rangePos24h !== undefined) cleaned.rangePos24h = patch.rangePos24h;
+      if (patch.high24Price !== undefined) cleaned.high24Price = patch.high24Price;
+      if (patch.low24Price !== undefined) cleaned.low24Price = patch.low24Price;
+      return cleaned;
+    };
 
     // Coalesce high-frequency WebSocket ticks into a smooth 450ms rAF-aligned commit
     flushTimer = setInterval(() => {
@@ -1268,10 +1316,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             const next = { ...prev };
             for (const [sym, p] of Object.entries(patchesToCommit)) {
               const oldP = prev[sym];
-              next[sym] =
-                oldP && p.amount24 === undefined && oldP.amount24 !== undefined
-                  ? { ...p, amount24: oldP.amount24 }
-                  : p;
+              next[sym] = oldP ? { ...oldP, ...stripUndefinedPatchKeys(p) } : stripUndefinedPatchKeys(p);
             }
             return next;
           });
@@ -1288,7 +1333,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         : exchange === "gate"
           ? "wss://fx-ws.gateio.ws/v4/ws/usdt"
           : exchange === "binance"
-            ? "wss://fstream.binance.com/ws/!miniTicker@arr"
+            ? "wss://fstream.binance.com/market/ws/!miniTicker@arr"
             : exchange === "hyperliquid"
               ? "wss://api.hyperliquid.xyz/ws"
               : "wss://stream.bybit.com/v5/public/linear";
@@ -1344,8 +1389,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           const defaultBybitSyms = [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "BNBUSDT", "HYPEUSDT",
             "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
-            "OPUSDT", "INJUSDT", "FETUSDT", "RENDERUSDT", "WIFUSDT", "PEPEUSDT", "BONKUSDT", "SHIBUSDT",
-            "TONUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "AAVEUSDT", "ENAUSDT", "ONDOUSDT", "PENDLEUSDT",
+            "OPUSDT", "INJUSDT", "HBARUSDT", "RENDERUSDT", "WIFUSDT", "1000PEPEUSDT", "1000BONKUSDT", "SHIB1000USDT",
+            "XLMUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "AAVEUSDT", "ENAUSDT", "ONDOUSDT", "PENDLEUSDT",
             "TIAUSDT", "SEIUSDT", "JUPUSDT", "TAOUSDT", "WLDUSDT", "FILUSDT", "ATOMUSDT", "ETCUSDT",
           ];
           const dynamicSyms = stableSortedSymbolsRef.current.slice(0, 120);
@@ -1406,7 +1451,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
               // Note: MEXC `push.tickers` only sends UTC+8 midnight-reset `riseFallRate`.
               // Omit `change24hPct` here so `mergedRows` smoothly re-anchors the true rolling 24h change against `patch.price`.
-              patches[sym] = {
+              patches[sym] = stripUndefinedPatchKeys({
                 price,
                 amount24: Number.isFinite(amt24) && amt24 > 0 ? amt24 : undefined,
                 basisPct: idxPrice > 0 ? ((price - idxPrice) / idxPrice) * 100 : undefined,
@@ -1417,7 +1462,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 high24Price: high24 > 0 ? high24 : undefined,
                 low24Price: low24 > 0 ? low24 : undefined,
                 updatedAt: now,
-              };
+              });
             }
           } else if (exchange === "binance") {
             const arr = JSON.parse(String(event.data)) as Array<{
@@ -1443,7 +1488,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               const high24 = Number(t.h);
               const low24 = Number(t.l);
               const qVol = Number(t.q);
-              patches[sym] = {
+              patches[sym] = stripUndefinedPatchKeys({
                 price,
                 amount24: Number.isFinite(qVol) && qVol > 0 ? qVol : undefined,
                 change24hPct: open24 > 0 ? ((price - open24) / open24) * 100 : undefined,
@@ -1454,7 +1499,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 high24Price: high24 > 0 ? high24 : undefined,
                 low24Price: low24 > 0 ? low24 : undefined,
                 updatedAt: now,
-              };
+              });
             }
           } else if (exchange === "hyperliquid") {
             const msg = JSON.parse(String(event.data)) as {
@@ -1506,7 +1551,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               const low24 = Number(t.low_24h);
               const chgPct = Number(t.change_percentage);
               const amt24 = Number(t.volume_24h_settle || t.volume_24h_quote);
-              patches[sym] = {
+              patches[sym] = stripUndefinedPatchKeys({
                 price,
                 amount24: Number.isFinite(amt24) && amt24 > 0 ? amt24 : undefined,
                 change24hPct: Number.isFinite(chgPct) ? chgPct : undefined,
@@ -1518,16 +1563,24 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 high24Price: high24 > 0 ? high24 : undefined,
                 low24Price: low24 > 0 ? low24 : undefined,
                 updatedAt: now,
-              };
+              });
             }
           } else if (exchange === "bybit") {
             const msg = JSON.parse(String(event.data)) as {
               topic?: string;
-              data?: { symbol?: string; lastPrice?: string; turnover24h?: string; price24hPcnt?: string };
+              data?: {
+                symbol?: string;
+                lastPrice?: string;
+                turnover24h?: string;
+                price24hPcnt?: string;
+                indexPrice?: string;
+                highPrice24h?: string;
+                lowPrice24h?: string;
+              };
             };
             if (!msg.topic?.startsWith("tickers.") || !msg.data?.symbol) return;
             const sym = msg.data.symbol;
-            const price = Number(msg.data.lastPrice);
+            const price = Number(msg.data.lastPrice || prevPricesRef.current[sym]);
             if (Number.isFinite(price) && price > 0) {
               const prevPrice = prevPricesRef.current[sym];
               if (prevPrice !== undefined && prevPrice !== price) {
@@ -1536,12 +1589,32 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               prevPricesRef.current[sym] = price;
               const t24 = Number(msg.data.turnover24h);
               const p24 = Number(msg.data.price24hPcnt);
-              patches[sym] = {
+              const rawIdxPrice = Number(msg.data.indexPrice);
+              const rawHigh24 = Number(msg.data.highPrice24h);
+              const rawLow24 = Number(msg.data.lowPrice24h);
+              const known = (bybitLastKnown[sym] ??= {});
+              if (Number.isFinite(rawHigh24) && rawHigh24 > 0) known.high24 = rawHigh24;
+              if (Number.isFinite(rawLow24) && rawLow24 > 0) known.low24 = rawLow24;
+              if (Number.isFinite(rawIdxPrice) && rawIdxPrice > 0) known.indexPrice = rawIdxPrice;
+              const high24 = known.high24 ?? 0;
+              const low24 = known.low24 ?? 0;
+              const idxPrice = known.indexPrice ?? 0;
+              patches[sym] = stripUndefinedPatchKeys({
                 price,
                 amount24: Number.isFinite(t24) && t24 > 0 ? t24 : undefined,
-                change24hPct: Number.isFinite(p24) ? p24 * 100 : undefined,
+                change24hPct:
+                  msg.data.price24hPcnt !== undefined && msg.data.price24hPcnt !== "" && Number.isFinite(p24)
+                    ? p24 * 100
+                    : undefined,
+                basisPct: idxPrice > 0 ? ((price - idxPrice) / idxPrice) * 100 : undefined,
+                high24Price: Number.isFinite(rawHigh24) && rawHigh24 > 0 ? rawHigh24 : undefined,
+                low24Price: Number.isFinite(rawLow24) && rawLow24 > 0 ? rawLow24 : undefined,
+                rangePos24h:
+                  high24 > low24 && low24 > 0
+                    ? Math.max(0, Math.min(100, ((price - low24) / (high24 - low24)) * 100))
+                    : undefined,
                 updatedAt: now,
-              };
+              });
             }
           }
 
@@ -1561,10 +1634,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 }
               }
               const prevPending = pendingPatches[sym];
-              pendingPatches[sym] =
-                prevPending && p.amount24 === undefined && prevPending.amount24 !== undefined
-                  ? { ...p, amount24: prevPending.amount24 }
-                  : p;
+              pendingPatches[sym] = prevPending
+                ? { ...prevPending, ...stripUndefinedPatchKeys(p) }
+                : stripUndefinedPatchKeys(p);
             }
             hasPending = true;
           }
@@ -2156,7 +2228,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     if (exchange !== "bybit" || !wsConnected) return;
     const ws = bybitWsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const topSyms = sortedSymbolOrder.slice(0, 60);
+    const topSyms = sortedSymbolOrder.slice(0, 120);
     const newSyms = topSyms.filter((s) => !bybitSubscribedRef.current.has(s));
     if (newSyms.length === 0) return;
     for (const s of newSyms) {
