@@ -246,6 +246,23 @@ export function ExchangeBadgeIcon({
     );
   }
 
+  if (exchange === "gate") {
+    // Official Gate.io blue-teal open-gate ring + geometric quadrant emblem
+    return (
+      <span
+        className={`inline-flex ${dim} shrink-0 items-center justify-center rounded-full bg-[#0b1526] ring-1 ring-[#2354E6]/55 shadow-[0_0_8px_rgba(35,84,230,0.28)]`}
+      >
+        <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none">
+          <path
+            d="M12 4.2C7.69 4.2 4.2 7.69 4.2 12C4.2 16.31 7.69 19.8 12 19.8C15.12 19.8 17.81 17.97 19.05 15.32H14.9C13.96 16.25 12.66 16.8 11.2 16.8C8.55 16.8 6.4 14.65 6.4 12C6.4 9.35 8.55 7.2 11.2 7.2H12V4.2Z"
+            fill="#2354E6"
+          />
+          <rect x="12.6" y="7.2" width="4.8" height="4.8" rx="0.8" fill="#17E6A1" />
+        </svg>
+      </span>
+    );
+  }
+
   if (exchange === "binance") {
     // Official Binance 5-diamond emblem inside a dark gold-ringed badge
     return (

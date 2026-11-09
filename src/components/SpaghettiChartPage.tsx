@@ -233,7 +233,7 @@ export default function SpaghettiChartPage({ mode, exchange = "mexc" }: { mode: 
                 Volume Mode
               </Link>
               <div className="h-4 w-px bg-zinc-800" />
-              {(["mexc", "bybit", "binance", "hyperliquid"] as ExchangeId[]).map((ex) => (
+              {(["mexc", "bybit", "gate", "binance", "hyperliquid"] as ExchangeId[]).map((ex) => (
                 <Link
                   key={ex}
                   href={exchangeSpaghettiPath(ex, mode)}

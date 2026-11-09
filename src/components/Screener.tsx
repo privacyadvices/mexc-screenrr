@@ -1243,11 +1243,13 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     const wsUrl =
       exchange === "mexc"
         ? "wss://contract.mexc.com/edge"
-        : exchange === "binance"
-          ? "wss://fstream.binance.com/ws/!miniTicker@arr"
-          : exchange === "hyperliquid"
-            ? "wss://api.hyperliquid.xyz/ws"
-            : "wss://stream.bybit.com/v5/public/linear";
+        : exchange === "gate"
+          ? "wss://fx-ws.gateio.ws/v4/ws/usdt"
+          : exchange === "binance"
+            ? "wss://fstream.binance.com/ws/!miniTicker@arr"
+            : exchange === "hyperliquid"
+              ? "wss://api.hyperliquid.xyz/ws"
+              : "wss://stream.bybit.com/v5/public/linear";
 
     const connect = () => {
       if (!alive) return;
@@ -1268,6 +1270,25 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               ws.send(JSON.stringify({ method: "ping" }));
             }
           }, 15_000);
+        } else if (exchange === "gate") {
+          ws.send(
+            JSON.stringify({
+              time: Math.floor(Date.now() / 1000),
+              channel: "futures.tickers",
+              event: "subscribe",
+              payload: ["!all"],
+            }),
+          );
+          pingTimer = setInterval(() => {
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  time: Math.floor(Date.now() / 1000),
+                  channel: "futures.ping",
+                }),
+              );
+            }
+          }, 15_000);
         } else if (exchange === "hyperliquid") {
           ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "allMids" } }));
           pingTimer = setInterval(() => {
@@ -1276,8 +1297,19 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             }
           }, 25_000);
         } else if (exchange === "bybit") {
-          const topSyms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "BNBUSDT", "HYPEUSDT"];
-          ws.send(JSON.stringify({ op: "subscribe", args: topSyms.map((s) => `tickers.${s}`) }));
+          const defaultBybitSyms = [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "BNBUSDT", "HYPEUSDT",
+            "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
+            "OPUSDT", "INJUSDT", "FETUSDT", "RENDERUSDT", "WIFUSDT", "PEPEUSDT", "BONKUSDT", "SHIBUSDT",
+            "TONUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "AAVEUSDT", "ENAUSDT", "ONDOUSDT", "PENDLEUSDT",
+            "TIAUSDT", "SEIUSDT", "JUPUSDT", "TAOUSDT", "WLDUSDT", "FILUSDT", "ATOMUSDT", "ETCUSDT",
+          ];
+          const dynamicSyms = stableSortedSymbolsRef.current.slice(0, 120);
+          const allSyms = [...new Set([...dynamicSyms, ...defaultBybitSyms])].slice(0, 120);
+          for (let i = 0; i < allSyms.length; i += 10) {
+            const chunk = allSyms.slice(i, i + 10);
+            ws.send(JSON.stringify({ op: "subscribe", args: chunk.map((s) => `tickers.${s}`) }));
+          }
           pingTimer = setInterval(() => {
             if (ws?.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ op: "ping" }));
@@ -1393,6 +1425,51 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               prevPricesRef.current[sym] = price;
               patches[sym] = {
                 price,
+                updatedAt: now,
+              };
+            }
+          } else if (exchange === "gate") {
+            const msg = JSON.parse(String(event.data)) as {
+              channel?: string;
+              event?: string;
+              result?: Array<{
+                contract?: string;
+                last?: string;
+                change_percentage?: string;
+                volume_24h_settle?: string;
+                volume_24h_quote?: string;
+                index_price?: string;
+                high_24h?: string;
+                low_24h?: string;
+              }>;
+            };
+            if (msg.channel !== "futures.tickers" || msg.event !== "update" || !Array.isArray(msg.result)) return;
+            for (const t of msg.result) {
+              const sym = t.contract;
+              if (!sym || !sym.endsWith("_USDT")) continue;
+              const price = Number(t.last);
+              if (!Number.isFinite(price) || price <= 0) continue;
+              const prevPrice = prevPricesRef.current[sym];
+              if (prevPrice !== undefined && prevPrice !== price) {
+                flashes[sym] = price > prevPrice ? "up" : "down";
+              }
+              prevPricesRef.current[sym] = price;
+              const idxPrice = Number(t.index_price);
+              const high24 = Number(t.high_24h);
+              const low24 = Number(t.low_24h);
+              const chgPct = Number(t.change_percentage);
+              const amt24 = Number(t.volume_24h_settle || t.volume_24h_quote);
+              patches[sym] = {
+                price,
+                amount24: Number.isFinite(amt24) && amt24 > 0 ? amt24 : undefined,
+                change24hPct: Number.isFinite(chgPct) ? chgPct : undefined,
+                basisPct: idxPrice > 0 ? ((price - idxPrice) / idxPrice) * 100 : undefined,
+                rangePos24h:
+                  high24 > low24 && low24 > 0
+                    ? Math.max(0, Math.min(100, ((price - low24) / (high24 - low24)) * 100))
+                    : undefined,
+                high24Price: high24 > 0 ? high24 : undefined,
+                low24Price: low24 > 0 ? low24 : undefined,
                 updatedAt: now,
               };
             }
@@ -3551,16 +3628,18 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
             {/* Center: Orion Exchange Switcher */}
             <div className="flex items-center gap-1 rounded-xl border border-[#22283a] bg-[#07090e] p-1 shadow-[inset_0_1px_3px_rgba(0,0,0,0.7)]">
-              {(["mexc", "bybit", "binance", "hyperliquid"] as ExchangeId[]).map((ex) => {
+              {(["mexc", "bybit", "gate", "binance", "hyperliquid"] as ExchangeId[]).map((ex) => {
                 const isActive = exchange === ex;
                 const activeStyle =
                   ex === "mexc"
                     ? "border-[#2998ff]/50 bg-gradient-to-b from-[#162542] to-[#0e172a] text-white shadow-[0_0_12px_rgba(41,152,255,0.25)]"
                     : ex === "bybit"
                       ? "border-[#f7a600]/50 bg-gradient-to-b from-[#2b2110] to-[#17120a] text-white shadow-[0_0_12px_rgba(247,166,0,0.2)]"
-                      : ex === "binance"
-                        ? "border-[#f0b90b]/50 bg-gradient-to-b from-[#29220e] to-[#171308] text-white shadow-[0_0_12px_rgba(240,185,11,0.2)]"
-                        : "border-[#50e3c2]/50 bg-gradient-to-b from-[#0e2b25] to-[#081916] text-white shadow-[0_0_12px_rgba(80,227,194,0.22)]";
+                      : ex === "gate"
+                        ? "border-[#2354e6]/55 bg-gradient-to-b from-[#122247] to-[#0a1329] text-white shadow-[0_0_12px_rgba(35,84,230,0.28)]"
+                        : ex === "binance"
+                          ? "border-[#f0b90b]/50 bg-gradient-to-b from-[#29220e] to-[#171308] text-white shadow-[0_0_12px_rgba(240,185,11,0.2)]"
+                          : "border-[#50e3c2]/50 bg-gradient-to-b from-[#0e2b25] to-[#081916] text-white shadow-[0_0_12px_rgba(80,227,194,0.22)]";
                 return (
                   <Link
                     key={ex}

@@ -24,26 +24,27 @@ const CACHE_TTL_MS = 5_000;
 function mapInterval(tvInterval: string): {
   mexc: string;
   bybit: string;
+  gate: string;
   binance: string;
   hl: string;
   seconds: number;
 } {
   switch (tvInterval) {
     case "1":
-      return { mexc: "Min1", bybit: "1", binance: "1m", hl: "1m", seconds: 60 };
+      return { mexc: "Min1", bybit: "1", gate: "1m", binance: "1m", hl: "1m", seconds: 60 };
     case "5":
-      return { mexc: "Min5", bybit: "5", binance: "5m", hl: "5m", seconds: 300 };
+      return { mexc: "Min5", bybit: "5", gate: "5m", binance: "5m", hl: "5m", seconds: 300 };
     case "15":
-      return { mexc: "Min15", bybit: "15", binance: "15m", hl: "15m", seconds: 900 };
+      return { mexc: "Min15", bybit: "15", gate: "15m", binance: "15m", hl: "15m", seconds: 900 };
     case "60":
-      return { mexc: "Min60", bybit: "60", binance: "1h", hl: "1h", seconds: 3600 };
+      return { mexc: "Min60", bybit: "60", gate: "1h", binance: "1h", hl: "1h", seconds: 3600 };
     case "240":
-      return { mexc: "Hour4", bybit: "240", binance: "4h", hl: "4h", seconds: 14400 };
+      return { mexc: "Hour4", bybit: "240", gate: "4h", binance: "4h", hl: "4h", seconds: 14400 };
     case "D":
     case "1D":
-      return { mexc: "Day1", bybit: "D", binance: "1d", hl: "1d", seconds: 86400 };
+      return { mexc: "Day1", bybit: "D", gate: "1d", binance: "1d", hl: "1d", seconds: 86400 };
     default:
-      return { mexc: "Min15", bybit: "15", binance: "15m", hl: "15m", seconds: 900 };
+      return { mexc: "Min15", bybit: "15", gate: "15m", binance: "15m", hl: "15m", seconds: 900 };
   }
 }
 
@@ -153,29 +154,69 @@ export async function GET(
         if (bars.length >= 15) break;
       }
     } else if (ex === "bybit") {
+      const bybitBases = ["https://api.bybit.com", "https://api.bytick.com"];
+      for (const base of bybitBases) {
+        try {
+          const url = `${base}/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}&interval=${intv.bybit}&limit=${limit}`;
+          const res = await fetch(url, {
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+            signal: AbortSignal.timeout(6_000),
+          });
+          if (res.ok) {
+            const json = (await res.json()) as {
+              retCode?: number;
+              result?: { list?: string[][] };
+            };
+            const list = json.result?.list || [];
+            const asc = [...list].reverse();
+            for (const r of asc) {
+              const time = Math.floor(Number(r[0]) / 1000);
+              const open = Number(r[1]);
+              const high = Number(r[2]);
+              const low = Number(r[3]);
+              const close = Number(r[4]);
+              const volume = Number(r[6] ?? r[5] ?? 0);
+              if (Number.isFinite(time) && Number.isFinite(close) && close > 0) {
+                bars.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+              }
+            }
+            if (bars.length > 0) break;
+          }
+        } catch {
+          // Try next base or fall back to cached 1m klines below
+        }
+      }
+    } else if (ex === "gate") {
       try {
-        const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}&interval=${intv.bybit}&limit=${limit}`;
+        const contractSym = symbol.includes("_") ? symbol : symbol.replace(/USDT$/, "_USDT");
+        const url = `https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=${encodeURIComponent(contractSym)}&interval=${intv.gate}&limit=${limit}`;
         const res = await fetch(url, {
           headers: { Accept: "application/json" },
           cache: "no-store",
           signal: AbortSignal.timeout(6_000),
         });
         if (res.ok) {
-          const json = (await res.json()) as {
-            retCode?: number;
-            result?: { list?: string[][] };
-          };
-          const list = json.result?.list || [];
-          const asc = [...list].reverse();
-          for (const r of asc) {
-            const time = Math.floor(Number(r[0]) / 1000);
-            const open = Number(r[1]);
-            const high = Number(r[2]);
-            const low = Number(r[3]);
-            const close = Number(r[4]);
-            const volume = Number(r[6] ?? r[5] ?? 0);
-            if (Number.isFinite(time) && Number.isFinite(close) && close > 0) {
-              bars.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+          const rows = (await res.json()) as Array<{
+            t?: number;
+            o?: string;
+            h?: string;
+            l?: string;
+            c?: string;
+            v?: number;
+            sum?: string;
+          }>;
+          if (Array.isArray(rows)) {
+            for (const r of rows) {
+              const time = Math.floor(Number(r.t));
+              const open = Number(r.o);
+              const high = Number(r.h);
+              const low = Number(r.l);
+              const close = Number(r.c);
+              const volume = Number(r.sum ?? r.v ?? 0);
+              if (Number.isFinite(time) && Number.isFinite(close) && close > 0) {
+                bars.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+              }
             }
           }
         }
@@ -253,7 +294,7 @@ export async function GET(
       }
     }
 
-    if (bars.length === 0 && (ex === "mexc" || ex === "bybit" || ex === "binance" || ex === "hyperliquid")) {
+    if (bars.length === 0 && (ex === "mexc" || ex === "bybit" || ex === "gate" || ex === "binance" || ex === "hyperliquid")) {
       const cached1m = getCached1mKline(ex as ExchangeId, symbol);
       if (cached1m && cached1m.close.length > 0) {
         const step = Math.max(1, Math.round(intv.seconds / 60));

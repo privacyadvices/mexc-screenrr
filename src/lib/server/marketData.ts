@@ -15,6 +15,8 @@ import type { ExchangeId } from "@/lib/exchange";
 const MEXC_BASE = "https://api.mexc.com";
 const BINANCE_BASE = "https://fapi.binance.com";
 const BYBIT_BASE = "https://api.bybit.com";
+const BYBIT_FALLBACK_BASE = "https://api.bytick.com";
+const GATE_BASE = "https://api.gateio.ws";
 const HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info";
 
 const CACHE_TTL_MS = 25_000;
@@ -30,6 +32,7 @@ const KLINE_LIMIT = 760; // 760 1-minute bars (12.6 hours) covers all sub-24h wi
 const SPAGHETTI_SYMBOL_LIMIT: Record<ExchangeId, number> = {
   mexc: 90,
   bybit: 90,
+  gate: 90,
   binance: 60,
   hyperliquid: 70,
 };
@@ -37,6 +40,7 @@ const SPAGHETTI_SYMBOL_LIMIT: Record<ExchangeId, number> = {
 const KLINE_SYMBOL_LIMIT: Record<ExchangeId, number> = {
   mexc: 1200,
   bybit: 900,
+  gate: 900,
   binance: 800,
   hyperliquid: 250,
 };
@@ -146,6 +150,18 @@ let bybitLaunchCache = new Map<string, { launchTime: number; priceScale?: number
 let bybitLaunchCachedAt = 0;
 let bybitLaunchInFlight: Promise<Map<string, { launchTime: number; priceScale?: number; maxLeverage?: number }>> | null = null;
 
+type GateContractMeta = {
+  launchTime: number;
+  priceScale?: number;
+  maxLeverage?: number;
+  fundingIntervalHours: number;
+  contractSize: number;
+  inDelisting: boolean;
+};
+let gateContractCache = new Map<string, GateContractMeta>();
+let gateContractCachedAt = 0;
+let gateContractInFlight: Promise<Map<string, GateContractMeta>> | null = null;
+
 const NEW_LISTING_WINDOW_MS = 7 * 24 * 3600_000; // 7 days
 
 const binanceOiCache = new Map<string, { at: number; oiCoins: number }>();
@@ -153,6 +169,7 @@ const binanceOiCache = new Map<string, { at: number; oiCoins: number }>();
 const oiHistoryByExchange = new Map<ExchangeId, OiSnapshotEntry[]>([
   ["mexc", []],
   ["bybit", []],
+  ["gate", []],
   ["binance", []],
   ["hyperliquid", []],
 ]);
@@ -228,7 +245,7 @@ async function ensureDiskSnapshotsLoaded(): Promise<void> {
     const raw = await readFile(SNAPSHOT_FILE_PATH, "utf8");
     const parsed = JSON.parse(raw) as Partial<Record<ExchangeId, OiSnapshotEntry[]>>;
     const cutoff = Date.now() - 26 * 3600_000;
-    for (const ex of ["mexc", "bybit", "binance", "hyperliquid"] as ExchangeId[]) {
+    for (const ex of ["mexc", "bybit", "gate", "binance", "hyperliquid"] as ExchangeId[]) {
       const arr = parsed[ex];
       if (Array.isArray(arr)) {
         oiHistoryByExchange.set(
@@ -286,6 +303,7 @@ async function recordTickerSnapshot(exchange: ExchangeId, tickers: NormalizedTic
         JSON.stringify({
           mexc: oiHistoryByExchange.get("mexc") ?? [],
           bybit: oiHistoryByExchange.get("bybit") ?? [],
+          gate: oiHistoryByExchange.get("gate") ?? [],
           binance: oiHistoryByExchange.get("binance") ?? [],
           hyperliquid: oiHistoryByExchange.get("hyperliquid") ?? [],
         }),
@@ -494,6 +512,76 @@ async function fetchBybitLaunchMap(
     });
   }
   return bybitLaunchInFlight;
+}
+
+async function fetchGateContractMetaMap(forceRefresh = false): Promise<Map<string, GateContractMeta>> {
+  const now = Date.now();
+  if (
+    gateContractCache.size &&
+    now - gateContractCachedAt < (forceRefresh ? 60_000 : CONTRACT_DETAIL_TTL_MS)
+  ) {
+    return gateContractCache;
+  }
+  if (!gateContractInFlight) {
+    gateContractInFlight = (async () => {
+      try {
+        const res = await fetch(`${GATE_BASE}/api/v4/futures/usdt/contracts`, {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+        if (!res.ok) return gateContractCache;
+        const list = (await res.json()) as Array<{
+          name?: string;
+          launch_time?: number;
+          create_time?: number;
+          order_price_round?: string;
+          mark_price_round?: string;
+          leverage_max?: string | number;
+          funding_interval?: number;
+          quanto_multiplier?: string | number;
+          in_delisting?: boolean;
+          status?: string;
+        }>;
+        const map = new Map<string, GateContractMeta>();
+        for (const item of Array.isArray(list) ? list : []) {
+          const sym = String(item.name ?? "");
+          if (!sym || !sym.endsWith("_USDT")) continue;
+          const rawLaunch = Number(item.launch_time || item.create_time || 0);
+          const launchTime = rawLaunch > 0 && rawLaunch < 1e11 ? rawLaunch * 1000 : rawLaunch;
+          const roundStr = String(item.order_price_round || item.mark_price_round || "");
+          const dotIdx = roundStr.indexOf(".");
+          const priceScale = dotIdx >= 0 ? Math.min(10, roundStr.length - dotIdx - 1) : undefined;
+          const maxLev = Number(item.leverage_max);
+          const fundingIntervalSec = Number(item.funding_interval || 28800);
+          const fundingIntervalHours =
+            Number.isFinite(fundingIntervalSec) && fundingIntervalSec > 0
+              ? Math.max(1, Math.round(fundingIntervalSec / 3600))
+              : 8;
+          const contractSize = Number(item.quanto_multiplier);
+          const inDelisting =
+            Boolean(item.in_delisting) || (typeof item.status === "string" && item.status !== "trading");
+          map.set(sym, {
+            launchTime: Number.isFinite(launchTime) ? launchTime : 0,
+            priceScale,
+            maxLeverage: Number.isFinite(maxLev) && maxLev > 0 ? maxLev : undefined,
+            fundingIntervalHours,
+            contractSize: Number.isFinite(contractSize) && contractSize > 0 ? contractSize : 1,
+            inDelisting,
+          });
+        }
+        if (map.size > 0) {
+          gateContractCache = map;
+          gateContractCachedAt = Date.now();
+        }
+        return gateContractCache;
+      } catch {
+        return gateContractCache;
+      }
+    })().finally(() => {
+      gateContractInFlight = null;
+    });
+  }
+  return gateContractInFlight;
 }
 
 async function fetchMexcFundingCyclesMap(): Promise<Map<string, number>> {
@@ -745,14 +833,38 @@ async function binanceFetch<T>(urlPath: string): Promise<T> {
 }
 
 async function bybitFetch<T>(urlPath: string): Promise<T> {
-  const res = await fetch(`${BYBIT_BASE}${urlPath}`, {
+  const bases = [BYBIT_BASE, BYBIT_FALLBACK_BASE];
+  let lastError: Error | null = null;
+  for (const base of bases) {
+    try {
+      const res = await fetch(`${base}${urlPath}`, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        lastError = new Error(`Bybit request failed (${base}): ${res.status}`);
+        continue;
+      }
+      const payload = (await res.json()) as { retCode: number; result: T; retMsg: string };
+      if (payload.retCode !== 0) {
+        lastError = new Error(`Bybit API error: ${payload.retMsg}`);
+        continue;
+      }
+      return payload.result;
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error("Bybit network error");
+    }
+  }
+  throw lastError ?? new Error("Bybit request failed");
+}
+
+async function gateFetch<T>(urlPath: string): Promise<T> {
+  const res = await fetch(`${GATE_BASE}${urlPath}`, {
     headers: { Accept: "application/json" },
     cache: "no-store",
   });
-  if (!res.ok) throw new Error(`Bybit request failed: ${res.status}`);
-  const payload = (await res.json()) as { retCode: number; result: T; retMsg: string };
-  if (payload.retCode !== 0) throw new Error(`Bybit API error: ${payload.retMsg}`);
-  return payload.result;
+  if (!res.ok) throw new Error(`Gate.io request failed: ${res.status}`);
+  return (await res.json()) as T;
 }
 
 async function hyperliquidPost<T>(body: Record<string, unknown>): Promise<T> {
@@ -1031,6 +1143,104 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
     return normalized;
   }
 
+  if (exchange === "gate") {
+    const [rawTickers, initialGateMetaMap] = await Promise.all([
+      gateFetch<
+        Array<{
+          contract?: string;
+          last?: string;
+          low_24h?: string;
+          high_24h?: string;
+          change_percentage?: string;
+          change_price?: string;
+          funding_rate?: string;
+          index_price?: string;
+          mark_price?: string;
+          volume_24h_settle?: string;
+          volume_24h_quote?: string;
+          total_size?: string;
+          highest_bid?: string;
+          lowest_ask?: string;
+          quanto_multiplier?: string;
+        }>
+      >("/api/v4/futures/usdt/tickers"),
+      fetchGateContractMetaMap(),
+      mexcDetailCache.size === 0 ? fetchMexcContractDetailsMap().catch(() => null) : Promise.resolve(null),
+    ]);
+    let gateMetaMap = initialGateMetaMap;
+    const activeGate = (Array.isArray(rawTickers) ? rawTickers : []).filter((t) => {
+      const sym = String(t.contract ?? "");
+      if (!sym.endsWith("_USDT") || Number(t.last) <= 0) return false;
+      const meta = gateMetaMap.get(sym);
+      if (meta?.inDelisting) return false;
+      return true;
+    });
+    if (gateMetaMap.size > 0 && activeGate.some((t) => !gateMetaMap.has(String(t.contract ?? "")))) {
+      gateMetaMap = await fetchGateContractMetaMap(true);
+    }
+
+    const nowMs = Date.now();
+    const normalized: NormalizedTicker[] = activeGate
+      .map((t) => {
+        const symbol = String(t.contract ?? "");
+        const price = Number(t.last);
+        const meta = gateMetaMap.get(symbol);
+        const quanto = Number(t.quanto_multiplier) || meta?.contractSize || 1;
+        const totalSize = Number(t.total_size || 0);
+        // Gate.io `total_size` in `/tickers` is double-sided (`long + short = 2 * position_size`),
+        // so single-sided Open Interest USD = `total_size * 0.5 * quanto_multiplier * price`.
+        const oiUsd =
+          Number.isFinite(totalSize) && totalSize > 0 && quanto > 0 ? totalSize * 0.5 * quanto * price : null;
+        const indexPrice = Number(t.index_price);
+        const bid1 = Number(t.highest_bid);
+        const ask1 = Number(t.lowest_ask);
+        const high24 = Number(t.high_24h);
+        const low24 = Number(t.low_24h);
+        const change24hPct = Number(t.change_percentage);
+        const rawChangePrice = Number(t.change_price);
+        const change24hUsd = Number.isFinite(rawChangePrice)
+          ? rawChangePrice
+          : Number.isFinite(change24hPct)
+            ? price * (change24hPct / 100)
+            : null;
+        const fundingRate = Number(t.funding_rate) || 0;
+        const fundingIntervalHours = meta?.fundingIntervalHours ?? 8;
+        const fundingRate1h = fundingRate / fundingIntervalHours;
+        const amount24 = Number(t.volume_24h_settle || t.volume_24h_quote || 0) || 0;
+        const isNew = meta ? meta.launchTime > 0 && nowMs - meta.launchTime <= NEW_LISTING_WINDOW_MS : false;
+
+        return {
+          symbol,
+          price,
+          priceScale: meta?.priceScale,
+          contractSize: quanto,
+          maxLeverage: meta?.maxLeverage ?? null,
+          amount24,
+          fundingRate,
+          fundingIntervalHours,
+          fundingRate1h,
+          oiUsd,
+          change24hPct: Number.isFinite(change24hPct) ? change24hPct : null,
+          change24hUsd,
+          basisPct: indexPrice > 0 ? ((price - indexPrice) / indexPrice) * 100 : null,
+          spreadBps: bid1 > 0 && ask1 >= bid1 && price > 0 ? ((ask1 - bid1) / price) * 10_000 : null,
+          rangePos24h:
+            high24 > low24 && low24 > 0
+              ? Math.max(0, Math.min(100, ((price - low24) / (high24 - low24)) * 100))
+              : null,
+          high24Price: high24 > 0 ? high24 : null,
+          low24Price: low24 > 0 ? low24 : null,
+          isNew,
+          sectors: lookupCoinSectors(symbol),
+          iconUrl: lookupCoinIcon(symbol),
+        };
+      })
+      .sort((a, b) => b.amount24 - a.amount24);
+
+    void recordTickerSnapshot("gate", normalized);
+    return normalized;
+  }
+
   // Bybit
   const [result, initialBybitMetaMap] = await Promise.all([
     bybitFetch<{
@@ -1279,6 +1489,48 @@ async function fetchKlineCached(exchange: ExchangeId, symbol: string, limit = KL
         if (!close.length) return null;
         const fetchedAt = Date.now();
         const parsed: KlineData = { fetchedAt, time, open, high, low, close, vol, trades };
+        klineCache.set(cacheKey, { at: fetchedAt, data: parsed });
+        return parsed;
+      }
+
+      if (exchange === "gate") {
+        const gateLimit = Math.min(1000, limit);
+        const rows = await gateFetch<
+          Array<{
+            t?: number;
+            o?: string;
+            h?: string;
+            l?: string;
+            c?: string;
+            v?: number;
+            sum?: string;
+          }>
+        >(`/api/v4/futures/usdt/candlesticks?contract=${encodeURIComponent(symbol)}&interval=1m&limit=${gateLimit}`);
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+        const time: number[] = [];
+        const open: number[] = [];
+        const high: number[] = [];
+        const low: number[] = [];
+        const close: number[] = [];
+        const vol: number[] = [];
+        for (const r of rows) {
+          const tVal = Math.floor(Number(r.t));
+          const oVal = Number(r.o);
+          const hVal = Number(r.h);
+          const lVal = Number(r.l);
+          const cVal = Number(r.c);
+          const sumVal = Number(r.sum);
+          if (!Number.isFinite(tVal) || !Number.isFinite(cVal) || cVal <= 0) continue;
+          time.push(tVal);
+          open.push(Number.isFinite(oVal) ? oVal : cVal);
+          high.push(Number.isFinite(hVal) ? hVal : cVal);
+          low.push(Number.isFinite(lVal) ? lVal : cVal);
+          close.push(cVal);
+          vol.push(Number.isFinite(sumVal) && sumVal >= 0 ? sumVal : 0);
+        }
+        if (!close.length || !open.length || !vol.length) return null;
+        const fetchedAt = Date.now();
+        const parsed: KlineData = { fetchedAt, time, open, high, low, close, vol };
         klineCache.set(cacheKey, { at: fetchedAt, data: parsed });
         return parsed;
       }
@@ -1896,7 +2148,7 @@ function calcBtcCorr(symbolKline: KlineData, btcKline: KlineData | null): Record
 }
 
 function getBtcSymbolForExchange(exchange: ExchangeId): string {
-  if (exchange === "mexc") return "BTC_USDT";
+  if (exchange === "mexc" || exchange === "gate") return "BTC_USDT";
   if (exchange === "hyperliquid") return "BTC";
   return "BTCUSDT";
 }
@@ -2790,8 +3042,8 @@ async function runBackgroundWarmerTick(): Promise<void> {
     // 1. Always warm MEXC (12 symbols per 2.4s tick = ~300 symbols/min, well under MEXC rate limit)
     await warmExchangeBatch("mexc", 12);
 
-    // 2. Rotate warming across Bybit, Hyperliquid, and Binance in parallel (separate exchange hosts!)
-    const otherExchanges: ExchangeId[] = ["bybit", "hyperliquid", "binance"];
+    // 2. Rotate warming across Bybit, Gate.io, Hyperliquid, and Binance in parallel (separate exchange hosts!)
+    const otherExchanges: ExchangeId[] = ["bybit", "gate", "hyperliquid", "binance"];
     const targetOther = otherExchanges[tickCount % otherExchanges.length];
     await warmExchangeBatch(targetOther, targetOther === "binance" ? 12 : 16);
   } catch {

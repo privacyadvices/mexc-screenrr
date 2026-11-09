@@ -1,16 +1,17 @@
-export const EXCHANGES = ["mexc", "bybit", "binance", "hyperliquid"] as const;
+export const EXCHANGES = ["mexc", "bybit", "gate", "binance", "hyperliquid"] as const;
 
 export type ExchangeId = (typeof EXCHANGES)[number];
 
 export const EXCHANGE_LABEL: Record<ExchangeId, string> = {
   mexc: "MEXC",
   bybit: "Bybit",
+  gate: "Gate.io",
   binance: "Binance",
   hyperliquid: "Hyperliquid",
 };
 
 export function toDisplaySymbol(exchange: ExchangeId, symbol: string): string {
-  if (exchange === "mexc") return symbol.replace("_USDT", "");
+  if (exchange === "mexc" || exchange === "gate") return symbol.replace("_USDT", "");
   if (exchange === "hyperliquid") return symbol.replace(/_USDT$/, "").replace(/USDT$/, "");
   return symbol.replace(/USDT$/, "");
 }
@@ -25,7 +26,7 @@ export function normalizeInputToExchangeSymbol(exchange: ExchangeId, input: stri
   const upper = input.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "");
   if (!upper) return "";
   const base = upper.replace(/_USDT$/, "").replace(/USDT$/, "").replace(/USD$/, "");
-  if (exchange === "mexc") return `${base}_USDT`;
+  if (exchange === "mexc" || exchange === "gate") return `${base}_USDT`;
   if (exchange === "hyperliquid") return base;
   return `${base}USDT`;
 }
@@ -37,6 +38,9 @@ export function toTradingViewSymbol(exchange: ExchangeId, symbol: string): { pre
   }
   if (exchange === "bybit") {
     return { prefix: "BYBIT", symbol: `${base}USDT.P` };
+  }
+  if (exchange === "gate") {
+    return { prefix: "GATEIO", symbol: `${base}USDT.P` };
   }
   if (exchange === "binance") {
     return { prefix: "BINANCE", symbol: `${base}USDT.P` };
@@ -52,6 +56,7 @@ export function toTradingViewChartUrl(exchange: ExchangeId, symbol: string): str
 
 export function toExchangeTradeUrl(exchange: ExchangeId, symbol: string): string {
   if (exchange === "mexc") return `https://futures.mexc.com/exchange/${symbol}`;
+  if (exchange === "gate") return `https://www.gate.io/futures/USDT/${symbol}`;
   if (exchange === "binance") return `https://www.binance.com/en/futures/${symbol}`;
   if (exchange === "hyperliquid") return `https://app.hyperliquid.xyz/trade/${toDisplaySymbol(exchange, symbol)}`;
   return `https://www.bybit.com/trade/usdt/${symbol}`;

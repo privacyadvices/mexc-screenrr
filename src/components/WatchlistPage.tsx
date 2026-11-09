@@ -213,7 +213,7 @@ export default function WatchlistPage() {
     const raw = addInput.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "");
     if (!raw) return;
     let normalized = raw;
-    if (addExchange === "mexc") {
+    if (addExchange === "mexc" || addExchange === "gate") {
       if (!normalized.endsWith("_USDT")) {
         normalized = normalized.replace(/USDT$/, "") + "_USDT";
       }
@@ -256,7 +256,7 @@ export default function WatchlistPage() {
             <div>
               <h1 className="text-base font-bold tracking-tight text-zinc-100">Multi-Exchange Watchlist</h1>
               <p className="font-mono text-[11px] text-zinc-500">
-                {rows.length} active perpetual contracts • Real-time MEXC / Bybit / Binance / Hyperliquid metrics
+                {rows.length} active perpetual contracts • Real-time MEXC / Bybit / Gate.io / Binance / Hyperliquid metrics
               </p>
             </div>
             <nav className="flex flex-wrap items-center gap-1.5 text-xs">
@@ -265,6 +265,9 @@ export default function WatchlistPage() {
               </Link>
               <Link href="/screener/bybit" className="rounded border border-zinc-700 bg-[#121621] px-2.5 py-1.5 text-zinc-300 hover:border-zinc-500">
                 Bybit
+              </Link>
+              <Link href="/screener/gate" className="rounded border border-zinc-700 bg-[#121621] px-2.5 py-1.5 text-zinc-300 hover:border-zinc-500">
+                Gate.io
               </Link>
               <Link href="/screener/binance" className="rounded border border-zinc-700 bg-[#121621] px-2.5 py-1.5 text-zinc-300 hover:border-zinc-500">
                 Binance
@@ -289,6 +292,7 @@ export default function WatchlistPage() {
             >
               <option value="mexc">MEXC</option>
               <option value="bybit">Bybit</option>
+              <option value="gate">Gate.io</option>
               <option value="binance">Binance</option>
               <option value="hyperliquid">Hyperliquid</option>
             </select>
