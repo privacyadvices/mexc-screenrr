@@ -911,6 +911,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
   const inFlightDeltaRef = useRef<boolean>(false);
   const lastKlineWaveAtRef = useRef<number>(0);
   const sortHydrationCountByKeyRef = useRef<Map<string, number>>(new Map());
+  const exchangeEpochRef = useRef<number>(0);
+  const dataExchangeRef = useRef<ExchangeId>(exchange);
+  const wasDropdownLockedRef = useRef<boolean>(false);
   const IDLE_PAUSE_MS = 3 * 60_000; // Pause background Vercel HTTP polling after 3m of no mouse/scroll/keyboard activity
 
   const isClientActiveForPolling = useCallback(() => {
@@ -920,6 +923,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
   const fetchScreenerData = useCallback(
     async (extraSyms: string[] = []) => {
+      const reqExchange = exchange;
+      const reqEpoch = exchangeEpochRef.current;
       const isPartialDelta = extraSyms.length > 0;
       if (isPartialDelta) {
         if (inFlightDeltaRef.current) return;
@@ -929,20 +934,26 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         if (!isPartialDelta) {
           setRefreshing(true);
           lastFullFetchAtRef.current = Date.now();
+        } else {
+          lastKlineWaveAtRef.current = Date.now();
         }
-        lastKlineWaveAtRef.current = Date.now();
         const params = new URLSearchParams();
         if (isPartialDelta) {
           params.set("symbols", extraSyms.join(","));
           params.set("partial", "1");
         }
         const qs = params.toString();
-        const endpoint = `/api/screener/${exchange}${qs ? `?${qs}` : ""}`;
+        const endpoint = `/api/screener/${reqExchange}${qs ? `?${qs}` : ""}`;
         const res = await fetch(endpoint);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const payload = (await res.json()) as ScreenerPayload;
+        if (reqEpoch !== exchangeEpochRef.current || reqExchange !== exchange) {
+          return;
+        }
         const now = Date.now();
-        lastKlineWaveAtRef.current = now;
+        if (isPartialDelta || (reqExchange === "mexc" && payload.quality === "fast")) {
+          lastKlineWaveAtRef.current = now;
+        }
         const cache = enrichedRowsCacheRef.current;
         const KLINE_CACHE_TTL_MS = 180_000; // 3-minute client kline cache TTL (matches server TTL & re-anchored live via WebSocket)
 
@@ -961,7 +972,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             for (const reqSym of extraSyms) {
               if (!hydratedSet.has(reqSym)) {
                 // Allow retry in ~3.5s if symbol was not hydrated in this wave
-                requestedKlinesRef.current.set(reqSym, now - (KLINE_CACHE_TTL_MS - 3_500));
+                requestedKlinesRef.current.set(reqSym, now - (90_000 - 3_500));
               }
             }
             try {
@@ -970,7 +981,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                 .sort((a, b) => b[1].at - a[1].at)
                 .slice(0, 400);
               window.sessionStorage.setItem(
-                `mexc-screener-kline-cache-v1:${exchange}`,
+                `mexc-screener-kline-cache-v1:${reqExchange}`,
                 JSON.stringify(entriesToSave),
               );
             } catch {
@@ -1002,18 +1013,21 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             });
           } else {
             for (const reqSym of extraSyms) {
-              requestedKlinesRef.current.set(reqSym, now - (KLINE_CACHE_TTL_MS - 3_500));
+              requestedKlinesRef.current.set(reqSym, now - (90_000 - 3_500));
             }
           }
           return;
         }
 
         const mergedServerRows = payload.rows.map((r) => {
+          const existingCached = cache.get(r.symbol);
           if (r.hasKlines !== false) {
-            cache.set(r.symbol, { at: now, row: r });
+            const preservedAt =
+              existingCached && now - existingCached.at < KLINE_CACHE_TTL_MS ? existingCached.at : now;
+            cache.set(r.symbol, { at: preservedAt, row: r });
             return r;
           }
-          const cached = cache.get(r.symbol);
+          const cached = existingCached;
           if (!cached || now - cached.at > KLINE_CACHE_TTL_MS) {
             if (cached) cache.delete(r.symbol);
             return r;
@@ -1027,6 +1041,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             const anchorPrice = cr.price / denom;
             return ((r.price - anchorPrice) / anchorPrice) * 100;
           };
+          const cacheAgeMs = now - cached.at;
           return {
             ...cr,
             price: r.price,
@@ -1045,7 +1060,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             isNew: r.isNew,
             isHot: r.isHot,
             sectors: r.sectors,
-            hasKlines: true,
+            hasKlines: cacheAgeMs <= 90_000,
             changePct: {
               "5m": reanchorCachedPct(cr.changePct["5m"]),
               "15m": reanchorCachedPct(cr.changePct["15m"]),
@@ -1077,13 +1092,14 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             .sort((a, b) => b[1].at - a[1].at)
             .slice(0, 400);
           window.sessionStorage.setItem(
-            `mexc-screener-kline-cache-v1:${exchange}`,
+            `mexc-screener-kline-cache-v1:${reqExchange}`,
             JSON.stringify(entriesToSave),
           );
         } catch {
           // Ignore sessionStorage quota errors
         }
 
+        dataExchangeRef.current = reqExchange;
         setData({ ...payload, rows: mergedServerRows });
         setLivePatches((prev) => {
           const next: Record<string, LiveTickPatch> = {};
@@ -1096,8 +1112,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         setQuality(payload.quality ?? null);
         setError(null);
       } catch (e) {
+        if (reqEpoch !== exchangeEpochRef.current) return;
         if (isPartialDelta) {
-          const retryBase = Date.now() - (180_000 - 3_500);
+          const retryBase = Date.now() - (90_000 - 3_500);
           for (const reqSym of extraSyms) {
             requestedKlinesRef.current.set(reqSym, retryBase);
           }
@@ -1106,11 +1123,13 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           setWarning(null);
         }
       } finally {
-        if (isPartialDelta) {
-          inFlightDeltaRef.current = false;
-        } else {
-          setLoading(false);
-          setRefreshing(false);
+        if (reqEpoch === exchangeEpochRef.current) {
+          if (isPartialDelta) {
+            inFlightDeltaRef.current = false;
+          } else {
+            setLoading(false);
+            setRefreshing(false);
+          }
         }
       }
     },
@@ -1159,13 +1178,26 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     };
   }, [IDLE_PAUSE_MS, fetchScreenerData]);
 
+  const clientPriceHistoryRef = useRef<Map<string, Array<{ ts: number; price: number }>>>(new Map());
+  const bybitWsRef = useRef<WebSocket | null>(null);
+  const bybitSubscribedRef = useRef<Set<string>>(new Set());
+  const lastSortedDataRef = useRef<ScreenerResponse | null>(null);
+
   // Periodic HTTP refresh (every 45s while active; live WebSocket handles sub-second updates)
   useEffect(() => {
+    exchangeEpochRef.current += 1;
+    inFlightDeltaRef.current = false;
+    wasDropdownLockedRef.current = false;
     setLoading(true);
+    setData(null);
     setLivePatches({});
+    setPriceFlashes({});
+    prevPricesRef.current = {};
+    clientPriceHistoryRef.current.clear();
     requestedKlinesRef.current.clear();
     sortHydrationCountByKeyRef.current.clear();
     enrichedRowsCacheRef.current.clear();
+    lastSortedDataRef.current = null;
     try {
       const raw = window.sessionStorage.getItem(`mexc-screener-kline-cache-v1:${exchange}`);
       if (raw) {
@@ -1232,7 +1264,17 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       window.requestAnimationFrame(() => {
         if (!alive) return;
         if (Object.keys(patchesToCommit).length > 0) {
-          setLivePatches((prev) => ({ ...prev, ...patchesToCommit }));
+          setLivePatches((prev) => {
+            const next = { ...prev };
+            for (const [sym, p] of Object.entries(patchesToCommit)) {
+              const oldP = prev[sym];
+              next[sym] =
+                oldP && p.amount24 === undefined && oldP.amount24 !== undefined
+                  ? { ...p, amount24: oldP.amount24 }
+                  : p;
+            }
+            return next;
+          });
         }
         if (Object.keys(flashesToCommit).length > 0) {
           setPriceFlashes(flashesToCommit);
@@ -1297,6 +1339,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
             }
           }, 25_000);
         } else if (exchange === "bybit") {
+          bybitWsRef.current = ws;
+          bybitSubscribedRef.current.clear();
           const defaultBybitSyms = [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT", "BNBUSDT", "HYPEUSDT",
             "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
@@ -1306,6 +1350,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           ];
           const dynamicSyms = stableSortedSymbolsRef.current.slice(0, 120);
           const allSyms = [...new Set([...dynamicSyms, ...defaultBybitSyms])].slice(0, 120);
+          for (const s of allSyms) {
+            bybitSubscribedRef.current.add(s);
+          }
           for (let i = 0; i < allSyms.length; i += 10) {
             const chunk = allSyms.slice(i, i + 10);
             ws.send(JSON.stringify({ op: "subscribe", args: chunk.map((s) => `tickers.${s}`) }));
@@ -1355,13 +1402,13 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
               const idxPrice = Number(t.indexPrice);
               const high24 = Number(t.high24Price);
               const low24 = Number(t.lower24Price);
-              const rfr = Number(t.riseFallRate);
               const amt24 = Number(t.amount24);
 
+              // Note: MEXC `push.tickers` only sends UTC+8 midnight-reset `riseFallRate`.
+              // Omit `change24hPct` here so `mergedRows` smoothly re-anchors the true rolling 24h change against `patch.price`.
               patches[sym] = {
                 price,
                 amount24: Number.isFinite(amt24) && amt24 > 0 ? amt24 : undefined,
-                change24hPct: Number.isFinite(rfr) ? rfr * 100 : undefined,
                 basisPct: idxPrice > 0 ? ((price - idxPrice) / idxPrice) * 100 : undefined,
                 rangePos24h:
                   high24 > low24 && low24 > 0
@@ -1513,8 +1560,12 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
                   if (arr.length > 360) arr.shift();
                 }
               }
+              const prevPending = pendingPatches[sym];
+              pendingPatches[sym] =
+                prevPending && p.amount24 === undefined && prevPending.amount24 !== undefined
+                  ? { ...p, amount24: prevPending.amount24 }
+                  : p;
             }
-            Object.assign(pendingPatches, patches);
             hasPending = true;
           }
           if (Object.keys(flashes).length > 0) {
@@ -1527,6 +1578,9 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       };
 
       ws.onclose = () => {
+        if (bybitWsRef.current === ws) {
+          bybitWsRef.current = null;
+        }
         setWsConnected(false);
         if (pingTimer) clearInterval(pingTimer);
         if (alive) {
@@ -1543,14 +1597,15 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
 
     return () => {
       alive = false;
+      if (bybitWsRef.current === ws) {
+        bybitWsRef.current = null;
+      }
       if (pingTimer) clearInterval(pingTimer);
       if (flushTimer) clearInterval(flushTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
   }, [exchange, wsEnabled]);
-
-  const clientPriceHistoryRef = useRef<Map<string, Array<{ ts: number; price: number }>>>(new Map());
 
   // Clear flash highlights periodically
   useEffect(() => {
@@ -1565,7 +1620,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
   // Every timeframe has its own distinct baseline (`row.changePct[tf]`) so live price ticks re-anchor
   // against each timeframe's distinct historical open price rather than applying a uniform delta from 0%.
   const mergedRows = useMemo(() => {
-    if (!data) return [];
+    if (!data || dataExchangeRef.current !== exchange) return [];
     if (Object.keys(livePatches).length === 0) return data.rows;
     const histMap = clientPriceHistoryRef.current;
 
@@ -1575,7 +1630,6 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       const priceRatio = row.price > 0 ? patch.price / row.price : 1;
       const liveOiUsd = row.oiUsd !== null ? row.oiUsd * priceRatio : null;
       const liveVol1d = patch.amount24 ?? row.volume["1d"];
-      const liveChg1d = patch.change24hPct ?? row.changePct["1d"];
 
       const tickDeltaUsd = patch.price - row.price;
       const reanchorPct = (oldPct: number | null): number | null => {
@@ -1585,6 +1639,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         const anchorPrice = row.price / denom;
         return ((patch.price - anchorPrice) / anchorPrice) * 100;
       };
+      const liveChg1d = patch.change24hPct ?? reanchorPct(row.changePct["1d"]);
 
       let chg5mPct = reanchorPct(row.changePct["5m"]);
       let chg5mUsd = row.changeUsd["5m"] !== null ? row.changeUsd["5m"] + tickDeltaUsd : null;
@@ -1593,7 +1648,12 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       let chg1hPct = reanchorPct(row.changePct["1h"]);
       let chg1hUsd = row.changeUsd["1h"] !== null ? row.changeUsd["1h"] + tickDeltaUsd : null;
       const symHist = histMap.get(row.symbol);
-      if (symHist && symHist.length >= 2) {
+      if (
+        symHist &&
+        symHist.length >= 2 &&
+        row.hasKlines === false &&
+        (chg5mPct === null || chg15mPct === null || chg1hPct === null)
+      ) {
         const findHistAnchor = (windowMs: number, maxToleranceMs: number) => {
           const targetTs = patch.updatedAt - windowMs;
           let best: { ts: number; price: number } | null = null;
@@ -1607,20 +1667,26 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           }
           return best && bestDiff <= maxToleranceMs && best.price > 0 ? best.price : null;
         };
-        const p5 = findHistAnchor(300_000, 45_000);
-        if (p5 !== null) {
-          chg5mPct = ((patch.price - p5) / p5) * 100;
-          chg5mUsd = patch.price - p5;
+        if (chg5mPct === null) {
+          const p5 = findHistAnchor(300_000, 15_000);
+          if (p5 !== null) {
+            chg5mPct = ((patch.price - p5) / p5) * 100;
+            chg5mUsd = patch.price - p5;
+          }
         }
-        const p15 = findHistAnchor(900_000, 90_000);
-        if (p15 !== null) {
-          chg15mPct = ((patch.price - p15) / p15) * 100;
-          chg15mUsd = patch.price - p15;
+        if (chg15mPct === null) {
+          const p15 = findHistAnchor(900_000, 30_000);
+          if (p15 !== null) {
+            chg15mPct = ((patch.price - p15) / p15) * 100;
+            chg15mUsd = patch.price - p15;
+          }
         }
-        const p1h = findHistAnchor(3_600_000, 240_000);
-        if (p1h !== null) {
-          chg1hPct = ((patch.price - p1h) / p1h) * 100;
-          chg1hUsd = patch.price - p1h;
+        if (chg1hPct === null) {
+          const p1h = findHistAnchor(3_600_000, 60_000);
+          if (p1h !== null) {
+            chg1hPct = ((patch.price - p1h) / p1h) * 100;
+            chg1hUsd = patch.price - p1h;
+          }
         }
       }
 
@@ -1652,6 +1718,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           "4h": row.changeUsd["4h"] !== null ? row.changeUsd["4h"] + tickDeltaUsd : null,
           "8h": row.changeUsd["8h"] !== null ? row.changeUsd["8h"] + tickDeltaUsd : null,
           "12h": row.changeUsd["12h"] !== null ? row.changeUsd["12h"] + tickDeltaUsd : null,
+          "1d": row.changeUsd["1d"] !== null ? row.changeUsd["1d"] + tickDeltaUsd : null,
         },
         volume: (() => {
           const volDelta =
@@ -1677,7 +1744,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         })(),
       };
     });
-  }, [data, livePatches]);
+  }, [data, exchange, livePatches]);
 
   // Live Alert Rule Evaluator (evaluates active rules against mergedRows with 180s per-coin cooldown)
   useEffect(() => {
@@ -1847,10 +1914,48 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     return [...core, ...metrics];
   }, [visible, effectiveManualFilters]);
 
-  // Compute filtered & sorted symbol order from server snapshot (data.rows) so 450ms WebSocket patches
-  // update live cell numbers in place without constantly jumping rows under the user's cursor or open chart.
+  // Compute filtered & sorted symbol order:
+  // - On explicit sort/filter changes or server data updates, filter & sort live `mergedRows` so sorting by CHG % immediately reflects live values.
+  // - During passive 450ms WebSocket ticks or when an inline dropdown chart is open during a background poll, lock the current row order so rows do not jump under the user's cursor.
   const sortedSymbolOrder = useMemo(() => {
-    const baseRows = data?.rows ?? [];
+    if (!data || dataExchangeRef.current !== exchange) return [];
+
+    const sortFilterKey = JSON.stringify({
+      exchange,
+      q: query.trim(),
+      exSym: excludedSymbolsInput,
+      exKw: excludedKeywordsInput,
+      sec: selectedSector,
+      exSec: [...excludedSectors],
+      hideUsStocks,
+      hideAllTradFi,
+      scopeMode,
+      enabledPresets,
+      presetThresholds,
+      effectiveManualFilters,
+      sortBy,
+      sortDir,
+      watchOnly,
+      pinWatchedFirst,
+      wl: pinWatchedFirst || watchOnly ? [...watchlistKeys] : [],
+    });
+
+    const isExplicitSortOrFilterChange =
+      sortFilterKey !== lastSortFilterKeyRef.current || userSortTriggerRef.current;
+    const isServerDataUpdate = data !== lastSortedDataRef.current;
+    const isDropdownOpen = dockMode === "dropdown" && Boolean(selectedSymbol);
+    const shouldResortAfterDropdownClose = !isDropdownOpen && wasDropdownLockedRef.current;
+
+    if (
+      !isExplicitSortOrFilterChange &&
+      !isServerDataUpdate &&
+      !shouldResortAfterDropdownClose &&
+      stableSortedSymbolsRef.current.length > 0
+    ) {
+      return stableSortedSymbolsRef.current;
+    }
+
+    const baseRows = mergedRows.length > 0 ? mergedRows : data.rows;
     if (!baseRows.length) return [];
     let out = baseRows;
 
@@ -1879,6 +1984,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       .map((x) => x.trim().toUpperCase())
       .filter(Boolean);
 
+    const hasKlineMetrics = (r: Row) => r.hasKlines !== false || r.changePct["12h"] !== null;
+
     out = out.filter((r) => {
       if (excludedSymbols.has(r.symbol)) return false;
       if (excludedKeywords.some((k) => r.symbol.includes(k))) return false;
@@ -1891,14 +1998,14 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       if (selectedSector !== "all" && !(r.sectors ?? []).includes(selectedSector)) return false;
 
       if (enabledPresets.pumpAlert) {
-        if (r.hasKlines === false) return false;
+        if (!hasKlineMetrics(r)) return false;
         const c5 = r.changePct["5m"] ?? -Infinity;
         const c15 = r.changePct["15m"] ?? -Infinity;
         const rv = r.rvol ?? 0;
         if (!((c5 >= 1.2 || c15 >= 2.0) && rv >= 1.1)) return false;
       }
       if (enabledPresets.oiSpike) {
-        if (r.hasKlines === false) return false;
+        if (!hasKlineMetrics(r)) return false;
         const oi5 = r.oiChangePct["5m"] ?? -Infinity;
         const oi15 = r.oiChangePct["15m"] ?? -Infinity;
         const oi1h = r.oiChangePct["1h"] ?? -Infinity;
@@ -1913,12 +2020,12 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         if (!((fundPct <= -0.015 || basis <= -0.15) && (c5 > 0.3 || c15 > 0.5 || c1h > 0.5))) return false;
       }
       if (enabledPresets.highVolume) {
-        if (r.hasKlines === false) return false;
+        if (!hasKlineMetrics(r)) return false;
         const rvolThreshold = presetThresholds.highVolume > 500 ? 2 : presetThresholds.highVolume;
         if (!compare(r.rvol, ">", rvolThreshold)) return false;
       }
       if (enabledPresets.bigMovers) {
-        if (r.hasKlines === false) return false;
+        if (!hasKlineMetrics(r)) return false;
         if (
           !compare(
             Math.max(
@@ -1950,29 +2057,6 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       return true;
     });
 
-    const sortFilterKey = JSON.stringify({
-      exchange,
-      q: query.trim(),
-      exSym: excludedSymbolsInput,
-      exKw: excludedKeywordsInput,
-      sec: selectedSector,
-      exSec: [...excludedSectors],
-      hideUsStocks,
-      hideAllTradFi,
-      scopeMode,
-      enabledPresets,
-      presetThresholds,
-      effectiveManualFilters,
-      sortBy,
-      sortDir,
-      watchOnly,
-      pinWatchedFirst,
-      wl: pinWatchedFirst || watchOnly ? [...watchlistKeys] : [],
-    });
-
-    const isExplicitSortOrFilterChange =
-      sortFilterKey !== lastSortFilterKeyRef.current || userSortTriggerRef.current;
-
     // When an inline dropdown chart is open and a background poll or on-demand kline enrichment arrives,
     // lock the current row order so the open chart does not jump to a different row index under the user.
     if (
@@ -1982,6 +2066,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       stableSortedSymbolsRef.current.length > 0 &&
       stableSortedSymbolsRef.current.includes(selectedSymbol)
     ) {
+      lastSortedDataRef.current = data;
+      wasDropdownLockedRef.current = true;
       const allowedSet = new Set(out.map((r) => r.symbol));
       const preserved = stableSortedSymbolsRef.current.filter((sym) => allowedSet.has(sym));
       const preservedSet = new Set(preserved);
@@ -1990,6 +2076,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
           preserved.push(r.symbol);
         }
       }
+      stableSortedSymbolsRef.current = preserved;
       return preserved;
     }
 
@@ -2005,8 +2092,8 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
       }
 
       if (preferVerifiedKlines) {
-        const aHasKlines = a.hasKlines !== false;
-        const bHasKlines = b.hasKlines !== false;
+        const aHasKlines = hasKlineMetrics(a);
+        const bHasKlines = hasKlineMetrics(b);
         if (aHasKlines !== bHasKlines) return aHasKlines ? -1 : 1;
       }
 
@@ -2035,10 +2122,13 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     const nextOrder = sorted.map((r) => r.symbol);
     stableSortedSymbolsRef.current = nextOrder;
     lastSortFilterKeyRef.current = sortFilterKey;
+    lastSortedDataRef.current = data;
+    wasDropdownLockedRef.current = false;
     userSortTriggerRef.current = false;
     return nextOrder;
   }, [
     data,
+    mergedRows,
     query,
     excludedSymbolsInput,
     excludedKeywordsInput,
@@ -2060,6 +2150,23 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     dockMode,
     selectedSymbol,
   ]);
+
+  // Dynamically subscribe newly visible top symbols on Bybit WebSocket when sort/filter order changes
+  useEffect(() => {
+    if (exchange !== "bybit" || !wsConnected) return;
+    const ws = bybitWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const topSyms = sortedSymbolOrder.slice(0, 60);
+    const newSyms = topSyms.filter((s) => !bybitSubscribedRef.current.has(s));
+    if (newSyms.length === 0) return;
+    for (const s of newSyms) {
+      bybitSubscribedRef.current.add(s);
+    }
+    for (let i = 0; i < newSyms.length; i += 10) {
+      const chunk = newSyms.slice(i, i + 10);
+      ws.send(JSON.stringify({ op: "subscribe", args: chunk.map((s) => `tickers.${s}`) }));
+    }
+  }, [exchange, sortedSymbolOrder, wsConnected]);
 
   const rows = useMemo(() => {
     if (!mergedRows.length || !sortedSymbolOrder.length) return [];
@@ -2125,7 +2232,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
         fundingCount += 1;
       }
 
-      if (v24 >= 100_000 && r.hasKlines !== false) {
+      if (v24 >= 100_000 && (r.hasKlines !== false || r.changePct["12h"] !== null)) {
         const c5m = r.changePct["5m"];
         if (c5m !== null && Number.isFinite(c5m)) {
           if (!top5mGainer || c5m > (top5mGainer.changePct["5m"] ?? -Infinity)) top5mGainer = r;
@@ -2300,7 +2407,7 @@ export default function Screener({ exchange = "mexc" }: { exchange?: ExchangeId 
     const isEligible = (r: Row | undefined) => {
       if (!r || r.hasKlines !== false || candidateSymbols.has(r.symbol)) return false;
       const lastReq = requestedKlinesRef.current.get(r.symbol) ?? 0;
-      return now - lastReq > 180_000;
+      return now - lastReq > 90_000;
     };
 
     // Priority 1: Visible viewport rows

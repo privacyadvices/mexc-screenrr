@@ -82,6 +82,8 @@ export type NormalizedTicker = {
   fundingIntervalHours?: number;
   fundingRate1h?: number | null;
   oiUsd: number | null;
+  change1hPct?: number | null;
+  change1hUsd?: number | null;
   change24hPct: number | null;
   change24hUsd: number | null;
   change7dPct?: number | null;
@@ -917,6 +919,23 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         const riseFallRate = Number(t.riseFallRate);
         const riseFallValue = Number(t.riseFallValue);
         const ratesObj = (t.riseFallRates as Record<string, unknown> | undefined) ?? {};
+        const tzRates = Array.isArray(t.riseFallRatesOfTimezone) ? t.riseFallRatesOfTimezone : null;
+        const rawR24 =
+          tzRates && tzRates.length > 0 && tzRates[0] !== null && tzRates[0] !== ""
+            ? Number(tzRates[0])
+            : ratesObj.r !== undefined && ratesObj.r !== null && ratesObj.r !== ""
+              ? Number(ratesObj.r)
+              : Number.NaN;
+        const r24 = Number.isFinite(rawR24) ? rawR24 : riseFallRate;
+        const change24hPct = Number.isFinite(r24) ? r24 * 100 : null;
+        const change24hUsd =
+          Number.isFinite(r24) && r24 !== riseFallRate && 1 + r24 > 0.0001
+            ? price - price / (1 + r24)
+            : Number.isFinite(riseFallValue)
+              ? riseFallValue
+              : Number.isFinite(r24) && 1 + r24 > 0.0001
+                ? price - price / (1 + r24)
+                : null;
 
         const basisPct =
           indexPrice > 0 && Number.isFinite(indexPrice) ? ((price - indexPrice) / indexPrice) * 100 : null;
@@ -937,8 +956,8 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
           fundingIntervalHours,
           fundingRate1h,
           oiUsd,
-          change24hPct: Number.isFinite(riseFallRate) ? riseFallRate * 100 : null,
-          change24hUsd: Number.isFinite(riseFallValue) ? riseFallValue : null,
+          change24hPct,
+          change24hUsd,
           change7dPct: ratesObj.r7 !== undefined && Number.isFinite(Number(ratesObj.r7)) ? Number(ratesObj.r7) * 100 : null,
           change30dPct: ratesObj.r30 !== undefined && Number.isFinite(Number(ratesObj.r30)) ? Number(ratesObj.r30) * 100 : null,
           change90dPct: ratesObj.r90 !== undefined && Number.isFinite(Number(ratesObj.r90)) ? Number(ratesObj.r90) * 100 : null,
@@ -1200,8 +1219,8 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         const rawChangePrice = Number(t.change_price);
         const change24hUsd = Number.isFinite(rawChangePrice)
           ? rawChangePrice
-          : Number.isFinite(change24hPct)
-            ? price * (change24hPct / 100)
+          : Number.isFinite(change24hPct) && 1 + change24hPct / 100 > 0.0001
+            ? price - price / (1 + change24hPct / 100)
             : null;
         const fundingRate = Number(t.funding_rate) || 0;
         const fundingIntervalHours = meta?.fundingIntervalHours ?? 8;
@@ -1248,6 +1267,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         symbol: string;
         lastPrice: string;
         indexPrice: string;
+        prevPrice1h?: string;
         prevPrice24h: string;
         price24hPcnt: string;
         highPrice24h: string;
@@ -1275,6 +1295,7 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
   const normalized = activeBybit
     .map((t) => {
       const price = Number(t.lastPrice);
+      const prev1h = Number(t.prevPrice1h);
       const prev24 = Number(t.prevPrice24h);
       const oiVal = Number(t.openInterestValue);
       const oiCoins = Number(t.openInterest);
@@ -1307,6 +1328,8 @@ export async function fetchTickers(exchange: ExchangeId): Promise<NormalizedTick
         fundingIntervalHours,
         fundingRate1h,
         oiUsd,
+        change1hPct: Number.isFinite(prev1h) && prev1h > 0 ? ((price - prev1h) / prev1h) * 100 : null,
+        change1hUsd: Number.isFinite(prev1h) && prev1h > 0 ? price - prev1h : null,
         change24hPct: Number.isFinite(pcnt) ? pcnt * 100 : null,
         change24hUsd: Number.isFinite(prev24) && prev24 > 0 ? price - prev24 : null,
         basisPct: indexPrice > 0 ? ((price - indexPrice) / indexPrice) * 100 : null,
@@ -1857,16 +1880,11 @@ function calcPerTimeframe(
     //    Anchor denominator to `currentMinuteOpenSec - bars * 60` because `lastClose` is `livePrice` at `nowSec`.
     //    Even when `kline` is cached for up to 3-4m, `kline.time` already contains the candle from `now - bars * 60`.
     let priceStartIdx = startIdx;
+    const liveTargetStartSec = currentMinuteOpenSec - bars * 60;
     if (!noBarsInWindow && lastBarSec > 0 && kline.time && kline.time.length === n) {
-      const liveTargetStartSec = currentMinuteOpenSec - bars * 60;
       let pIdx = n - 1;
       while (pIdx > 0 && kline.time[pIdx] > liveTargetStartSec) {
         pIdx--;
-      }
-      if (kline.time[pIdx] < liveTargetStartSec - 60 && pIdx + 1 < n) {
-        pIdx = pIdx + 1;
-      } else if (kline.time[pIdx] < liveTargetStartSec && pIdx + 1 < n && kline.time[pIdx + 1] <= liveTargetStartSec + 60) {
-        pIdx = pIdx + 1;
       }
       priceStartIdx = pIdx;
     }
@@ -1875,16 +1893,20 @@ function calcPerTimeframe(
     let changeUsdVal: number | null = null;
     if (noBarsInWindow) {
       const snapChg = lookupSnapshotPriceChange(exchange, symbol, lastClose, tf);
-      changePctVal = snapChg.pct ?? 0;
-      changeUsdVal = snapChg.usd ?? 0;
+      const prevClose = n > 0 ? kline.close[n - 1] : null;
+      changePctVal =
+        snapChg.pct ?? (prevClose && prevClose > 0 ? pctChange(lastClose, prevClose) : 0);
+      changeUsdVal =
+        snapChg.usd ?? (prevClose && prevClose > 0 ? lastClose - prevClose : 0);
     } else if (priceStartIdx >= 0 && priceStartIdx < n) {
-      const candidateOpen = kline.open[priceStartIdx] ?? kline.close[priceStartIdx];
+      const barTimeSec = lastBarSec > 0 && kline.time ? kline.time[priceStartIdx] : undefined;
+      const candidateOpen =
+        barTimeSec !== undefined && barTimeSec < liveTargetStartSec
+          ? (kline.close[priceStartIdx] ?? kline.open[priceStartIdx])
+          : (kline.open[priceStartIdx] ?? kline.close[priceStartIdx]);
       if (Number.isFinite(candidateOpen) && candidateOpen > 0) {
         changePctVal = pctChange(lastClose, candidateOpen);
-        changeUsdVal =
-          changePctVal !== null && Number.isFinite(lastClose) && lastClose > 0
-            ? lastClose * (changePctVal / 100)
-            : lastClose - candidateOpen;
+        changeUsdVal = lastClose - candidateOpen;
       }
     }
 
@@ -1932,7 +1954,8 @@ function calcPerTimeframe(
       const prevEnd = startIdx;
       const prevStart = Math.max(0, prevEnd - bars);
       const availPrevBars = prevEnd - prevStart;
-      if (availPrevBars >= 1) {
+      const minPrevBars = Math.max(1, Math.min(Math.ceil(bars * 0.25), 60));
+      if (availPrevBars >= minPrevBars) {
         let prevAcc = 0;
         for (let i = prevStart; i < prevEnd; i++) {
           prevAcc += kline.vol[i] || 0;
@@ -2178,8 +2201,8 @@ function selectPriorityKlineSymbols(
   const btcSymbol = getBtcSymbolForExchange(exchange);
   const set = new Set<string>([btcSymbol, ...extraSymbols]);
 
-  // 0. Always include the top 45 overall highest-volume tickers (which appear on the initial default view)
-  for (let i = 0; i < Math.min(45, tickers.length); i++) {
+  // 0. Always include the top 25 overall highest-volume tickers (which appear on the initial default view)
+  for (let i = 0; i < Math.min(25, tickers.length); i++) {
     if (set.size >= limit) break;
     set.add(tickers[i].symbol);
   }
@@ -2189,20 +2212,14 @@ function selectPriorityKlineSymbols(
   const tradfiTickers = tickers.filter((t) => isStockOrTradFiTicker(t));
   const orderedTickers = [...cryptoTickers, ...tradfiTickers];
 
-  // 1. Top by 24h volume (50% of budget)
-  const volSlice = Math.floor(limit * 0.5);
-  for (let i = 0; i < Math.min(volSlice, orderedTickers.length); i++) {
-    if (set.size >= limit) break;
-    set.add(orderedTickers[i].symbol);
-  }
-
-  // 2. Top live 5m, 15m, and 1h BOTH descending (gainers) AND ascending (losers)
+  // 1. Immediately prioritize top live 24h, 5m, 15m, 1h, and OI 15m movers (both gainers and losers)
+  //    so sorting by CHG % (1D..5M) or OI CHG % has Tier-0 (<150) priority klines instead of being starved behind 600 volume symbols.
   const activePool = orderedTickers.filter((t) => t.amount24 >= 15_000);
   const scored = activePool.map((t) => ({
     symbol: t.symbol,
     p5: lookupSnapshotPriceChange(exchange, t.symbol, t.price, "5m").pct ?? 0,
     p15: lookupSnapshotPriceChange(exchange, t.symbol, t.price, "15m").pct ?? 0,
-    p1h: lookupSnapshotPriceChange(exchange, t.symbol, t.price, "1h").pct ?? 0,
+    p1h: t.change1hPct ?? lookupSnapshotPriceChange(exchange, t.symbol, t.price, "1h").pct ?? 0,
     p24h: t.change24hPct ?? 0,
     oi15: lookupSnapshotOiChange(exchange, t.symbol, t.oiUsd, t.price, "15m").pct ?? 0,
   }));
@@ -2219,11 +2236,18 @@ function selectPriorityKlineSymbols(
     }
   };
 
+  addTopBothDirections((x) => x.p24h, 25);
   addTopBothDirections((x) => x.p5, 22);
   addTopBothDirections((x) => x.p15, 22);
   addTopBothDirections((x) => x.p1h, 18);
   addTopBothDirections((x) => x.oi15, 16);
-  addTopBothDirections((x) => x.p24h, 25);
+
+  // 2. Top by 24h volume (50% of budget)
+  const volSlice = Math.floor(limit * 0.5);
+  for (let i = 0; i < Math.min(volSlice, orderedTickers.length); i++) {
+    if (set.size >= limit) break;
+    set.add(orderedTickers[i].symbol);
+  }
 
   // 2b. Prioritize newly launched contracts (NEW badge) so new listings warm 1m klines immediately
   for (const t of orderedTickers) {
@@ -2325,13 +2349,16 @@ function composeScreenerRows(
 
     if (!kline) {
       const chg24Pct = ticker.change24hPct ?? 0;
-      const chg24Usd = ticker.change24hUsd ?? (ticker.price > 0 ? ticker.price * (chg24Pct / 100) : 0);
+      const chg24Usd =
+        ticker.change24hUsd ??
+        (ticker.price > 0 && 1 + chg24Pct / 100 > 0.0001
+          ? ticker.price - ticker.price / (1 + chg24Pct / 100)
+          : 0);
       const vol24 = Math.max(0, ticker.amount24 || 0);
       const high24 = ticker.high24Price && ticker.high24Price > 0 ? ticker.high24Price : ticker.price * 1.01;
       const low24 = ticker.low24Price && ticker.low24Price > 0 ? ticker.low24Price : ticker.price * 0.99;
       const range24Pct =
         low24 > 0 && high24 >= low24 ? ((high24 - low24) / low24) * 100 : Math.max(0.8, Math.abs(chg24Pct));
-      const rangePos = ticker.rangePos24h ?? 50;
       const base1mVolty = Math.max(0.02, range24Pct / Math.sqrt(1440));
 
       const changePctMap = { ...emptyByTf };
@@ -2351,62 +2378,32 @@ function composeScreenerRows(
         symSeed = (symSeed * 31 + ticker.symbol.charCodeAt(i)) >>> 0;
       }
       const symFactor = 0.88 + (symSeed % 25) / 100; // 0.88 .. 1.12
-      const symPhase = ((symSeed % 360) / 360) * Math.PI * 2;
-
-      const historyList = oiHistoryByExchange.get(exchange) ?? [];
-      const oldestEntry = historyList.find((e) => (e.price?.[ticker.symbol] ?? 0) > 0) ?? null;
-      const oldestPrice = oldestEntry?.price?.[ticker.symbol] ?? null;
-      const oldestAgeMs = oldestEntry ? Date.now() - oldestEntry.ts : 0;
 
       for (let idxTf = 0; idxTf < TIMEFRAMES.length; idxTf++) {
         const tf = TIMEFRAMES[idxTf];
         const mins = TIMEFRAME_TO_MINUTES[tf];
         const snapChg = lookupSnapshotPriceChange(exchange, ticker.symbol, ticker.price, tf);
         const snapOi = lookupSnapshotOiChange(exchange, ticker.symbol, oiUsd, ticker.price, tf);
-        const targetMs = mins * 60_000;
 
         if (tf === "1d") {
           changePctMap[tf] = ticker.change24hPct ?? 0;
           changeUsdMap[tf] = chg24Usd;
-        } else if (snapChg.pct !== null && snapChg.usd !== null && Math.abs(snapChg.pct) > 0.0001) {
+        } else if (tf === "1h" && ticker.change1hPct !== undefined && ticker.change1hPct !== null) {
+          changePctMap[tf] = ticker.change1hPct;
+          changeUsdMap[tf] =
+            ticker.change1hUsd ??
+            (ticker.price > 0 && 1 + ticker.change1hPct / 100 > 0.0001
+              ? ticker.price - ticker.price / (1 + ticker.change1hPct / 100)
+              : 0);
+        } else if (snapChg.pct !== null && snapChg.usd !== null) {
           changePctMap[tf] = snapChg.pct;
           changeUsdMap[tf] = snapChg.usd;
-        } else if (
-          oldestPrice &&
-          oldestPrice > 0 &&
-          oldestEntry &&
-          oldestAgeMs >= (tf === "5m" ? 45_000 : targetMs * 0.55) &&
-          oldestAgeMs <= targetMs * 1.45 &&
-          Math.abs(ticker.price - oldestPrice) > 0
-        ) {
-          const pct = ((ticker.price - oldestPrice) / oldestPrice) * 100;
-          changePctMap[tf] = pct;
-          changeUsdMap[tf] = ticker.price - oldestPrice;
         } else {
-          // Timeframe-distinct non-zero estimate derived from live 24h drift, 24h range position, and any observed snapshot move
-          const tfFrac = mins / 1440;
-          const driftComponent = chg24Pct * (0.42 * tfFrac + 0.58 * Math.pow(tfFrac, 0.6)) * symFactor;
-          const rangeComponent =
-            ((rangePos - 50) / 50) * Math.min(12, range24Pct) * 0.085 * Math.pow(tfFrac, 0.42);
-          const harmonicOffset =
-            Math.sin(symPhase + (idxTf + 1) * 0.93) *
-            Math.max(0.025, Math.min(1.2, range24Pct * 0.025)) *
-            Math.pow(tfFrac, 0.32);
-          let estPct = driftComponent + rangeComponent + harmonicOffset;
-          if (oldestPrice && oldestPrice > 0 && oldestAgeMs >= 20_000 && oldestAgeMs < targetMs) {
-            const observedPct = ((ticker.price - oldestPrice) / oldestPrice) * 100;
-            const obsWeight = Math.min(0.85, Math.max(0.25, Math.sqrt(oldestAgeMs / targetMs)));
-            estPct = observedPct * obsWeight + estPct * (1 - obsWeight * 0.5);
-          }
-          if (Math.abs(estPct) < 0.01) {
-            const dir = chg24Pct > 0 ? 1 : chg24Pct < 0 ? -1 : rangePos >= 50 ? 1 : -1;
-            estPct = dir * (0.012 + (idxTf + 1) * 0.006 * symFactor);
-          }
-          changePctMap[tf] = estPct;
-          changeUsdMap[tf] = ticker.price > 0 ? ticker.price * (estPct / 100) : 0;
+          changePctMap[tf] = null;
+          changeUsdMap[tf] = null;
         }
 
-        const cPct = changePctMap[tf] ?? 0;
+        const cPct = changePctMap[tf] ?? chg24Pct * (mins / 1440);
 
         if (snapOi.pct !== null && snapOi.usd !== null && Math.abs(snapOi.pct) > 0.0001) {
           oiChangePctMap[tf] = snapOi.pct;
@@ -2800,7 +2797,7 @@ export async function getScreenerPayload(
     const toFetch = [...new Set([btcSymbol, ...requestedSlice])]
       .filter((sym) => {
         const c = klineCache.get(`${exchange}:${sym}:1m`);
-        return !c || now - c.at >= KLINE_CACHE_TTL_MS;
+        return !c || now - c.at >= 90_000;
       })
       .slice(0, exchange === "mexc" ? 18 : 25);
     if (exchange === "binance") {
